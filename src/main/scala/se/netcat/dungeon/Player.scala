@@ -5,32 +5,28 @@ import akka.io.Tcp
 import akka.util.ByteString
 
 import scala.concurrent.duration._
+import scala.util.parsing.combinator.RegexParsers
+
+trait PlayerParsers extends RegexParsers {
+  def name: Parser[String] = "[a-zA-Z]+".r ^^ { _.toLowerCase }
+
+  def yes: Parser[Boolean] = "yes" ^^^ true
+  def no: Parser[Boolean] = "no" ^^^ false
+
+  def boolean: Parser[Boolean] = yes | no
+}
+
+object PlayerParsers extends PlayerParsers {
+  sealed trait Command
+  case class Use(name: String) extends Command
+  case class Create(name: String) extends Command
+  case class Exit() extends Command
+}
 
 object Player {
   case class IncomingMessage(data: String)
   case class OutgoingMessage(data: String)
   case class Terminate()
-}
-
-class TcpPlayer(connection: ActorRef, characters: ActorRef)
-  extends Player(connection, characters) with ActorLogging {
-
-  def decode(data: ByteString) = data.decodeString("UTF-8")
-  def encode(data: String) = ByteString(data, "UTF-8")
-
-  val newline = "\r\n"
-
-  override def receive: Actor.Receive = {
-    case Tcp.Received(data) =>
-      self ! Player.IncomingMessage(decode(data))
-    case Tcp.PeerClosed =>
-      self ! Player.Terminate
-    case message @ _ =>
-      super.receive(message)
-  }
-
-  def send(data: String) =
-    connection ! Tcp.Write(encode(data + newline))
 }
 
 object PlayerState extends Enumeration {
@@ -85,7 +81,7 @@ abstract class Player(connection: ActorRef, characters: ActorRef)
 
   when(CharacterLogin, stateTimeout = 60 second) {
     case Event(Player.IncomingMessage(data), DataNone()) =>
-      val name = ConnectionParsers.parse(ConnectionParsers.name, data)
+      val name = PlayerParsers.parse(PlayerParsers.name, data)
 
       if (name.successful) {
         characters ! Characters.GetCharacterByName(name.get)
@@ -106,7 +102,7 @@ abstract class Player(connection: ActorRef, characters: ActorRef)
 
   when (CharacterCreate, stateTimeout = 60 second) {
     case Event(Player.IncomingMessage(data), DataName(name)) =>
-      val boolean = ConnectionParsers.parse(ConnectionParsers.boolean, data)
+      val boolean = PlayerParsers.parse(PlayerParsers.boolean, data)
 
       if (boolean.successful) {
         if (boolean.get) {
@@ -132,17 +128,17 @@ abstract class Player(connection: ActorRef, characters: ActorRef)
 
   when (Play, stateTimeout = 3600 second) {
     case Event(Player.IncomingMessage(data), DataPlaying(character)) =>
-      val command = DungeonParsers.parse(DungeonParsers.command, data)
+      val command = CharacterParsers.parse(CharacterParsers.command, data)
 
       if (command.successful) {
         command.get match {
-          case message @ DungeonParsers.Look(direction) =>
+          case message @ CharacterParsers.Look(direction) =>
             character ! message
             stay()
-          case message @ DungeonParsers.Walk(direction) =>
+          case message @ CharacterParsers.Walk(direction) =>
             character ! message
             stay()
-          case DungeonParsers.Exit() =>
+          case CharacterParsers.Exit() =>
             goto(CharacterLogin).using(DataNone())
         }
       } else {
@@ -165,3 +161,25 @@ abstract class Player(connection: ActorRef, characters: ActorRef)
       stay()
   }
 }
+
+class TcpPlayer(connection: ActorRef, characters: ActorRef)
+  extends Player(connection, characters) with ActorLogging {
+
+  def decode(data: ByteString) = data.decodeString("UTF-8")
+  def encode(data: String) = ByteString(data, "UTF-8")
+
+  val newline = "\r\n"
+
+  override def receive: Actor.Receive = {
+    case Tcp.Received(data) =>
+      self ! Player.IncomingMessage(decode(data))
+    case Tcp.PeerClosed =>
+      self ! Player.Terminate
+    case message @ _ =>
+      super.receive(message)
+  }
+
+  def send(data: String) =
+    connection ! Tcp.Write(encode(data + newline))
+}
+
