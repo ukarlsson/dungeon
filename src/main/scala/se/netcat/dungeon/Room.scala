@@ -24,6 +24,10 @@ class Room(brief: String, exits: () => Map[Direction.Value, ActorRef]) extends A
     case GetDescription() => sender ! GetDescriptionResult(description())
     case CharacterEnter(character) => characters += character
     case CharacterLeave(character) => characters -= character
+    case message @ Character.Message(_, _, _) =>
+      for (character <- characters) {
+        character ! message
+      }
   }
 }
 

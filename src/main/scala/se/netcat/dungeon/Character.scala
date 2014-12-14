@@ -1,25 +1,21 @@
 package se.netcat.dungeon
 
-import java.net.InetSocketAddress
-
 import akka.actor._
-import akka.io.{IO, Tcp}
-import akka.util.Timeout
-import se.netcat.dungeon.Character.Description
-
-import scala.collection
-import scala.collection.mutable
-import scala.util.parsing.combinator.RegexParsers
 import akka.pattern._
-import scala.concurrent.duration._
+
+import scala.collection.mutable
 import scala.concurrent.ExecutionContext.Implicits.global
+import scala.concurrent.duration._
+import scala.util.parsing.combinator.RegexParsers
 
 
 
 trait CharacterParsers extends RegexParsers {
-  import CharacterParsers._
+  import se.netcat.dungeon.CharacterParsers._
 
   def direction:Parser[Direction.Value] = Direction.values.toList.map(v => v.toString ^^^ v).reduceLeft(_ | _)
+
+  def wildcard: Parser[String] = """(.+)""".r ^^ { _.toString }
 
   def look: Parser[Look] = "look" ~ opt(direction) ^^ {
     case _ ~ Some(v) => Look(Some(v))
@@ -30,13 +26,18 @@ trait CharacterParsers extends RegexParsers {
     case v => Walk(v)
   }
 
-  def command: Parser[Command] = look | walk
+  def say: Parser[Say] = "say" ~ wildcard ^^ {
+    case _ ~ message => Say(message)
+  }
+
+  def command: Parser[Command] = look | walk | say
 }
 
 object CharacterParsers extends CharacterParsers {
   sealed trait Command
   case class Look(direction: Option[Direction.Value]) extends Command
   case class Walk(direction: Direction.Value) extends Command
+  case class Say(line: String) extends Command
 }
 object Characters {
   case class CreateCharacter(name: String)
@@ -60,6 +61,13 @@ object CharacterData {
   case object DataNone extends Data
 }
 
+object CharacterMessageCategory extends Enumeration {
+  type MessageCategory = Value
+
+  val Say = Value("say")
+  val Tell = Value("tell")
+}
+
 object Character {
   case class Connect(connection: ActorRef)
   case class Disconnect(connection: ActorRef)
@@ -67,10 +75,12 @@ object Character {
   case class GetDescription()
   case class GetDescriptionResult(description: Character.Description)
 
-  case class Description(brief: String, complete: String)
+  case class Description(name: String, brief: String, complete: String)
 
   case class LookRoomResult(description: Room.Description, characters: Map[ActorRef, Character.Description])
   case class WalkResult(to: Option[ActorRef])
+
+  case class Message(category: CharacterMessageCategory.Value, sender: ActorRef, description: Character.Description, message: String)
 }
 
 class CharacterLookCollector(character: ActorRef, input: Room.Description) extends LoggingFSM[Option[Nothing], Option[Nothing]] {
@@ -104,13 +114,17 @@ class CharacterLookCollector(character: ActorRef, input: Room.Description) exten
   }
 }
 
-class Character(name: String, var room: ActorRef)
+class Character(name: String, val start: ActorRef)
   extends LoggingFSM[CharacterState.Value, CharacterData.Data] with ActorLogging {
 
-  import CharacterState._
-  import CharacterData._
+  import se.netcat.dungeon.CharacterData._
+  import se.netcat.dungeon.CharacterState._
 
-  val connections: mutable.HashSet[ActorRef] = mutable.HashSet()
+  val connections: mutable.Set[ActorRef] = mutable.Set()
+
+  object CurrentRoom {
+    var reference = start
+  }
 
   startWith(Idle, DataNone)
 
@@ -120,25 +134,25 @@ class Character(name: String, var room: ActorRef)
 
   def description(): Character.Description = {
     val brief = "%s the furry creature.".format(name.capitalize)
-    Character.Description(brief, brief)
+    Character.Description(name, brief, brief)
   }
 
   override def preStart(): Unit = {
-    room ! Room.CharacterEnter(self)
+    CurrentRoom.reference ! Room.CharacterEnter(self)
   }
 
   override def postStop(): Unit = {
-    room ! Room.CharacterLeave(self)
+    CurrentRoom.reference ! Room.CharacterLeave(self)
   }
 
   def walk(direction : Direction.Value) =
-    room.ask(Room.GetDescription())(5 second).map({
+    CurrentRoom.reference.ask(Room.GetDescription())(5 second).map({
       case Room.GetDescriptionResult(description) =>
         self ! Character.WalkResult(description.exits.get(direction))
     })
 
   def look() =
-    room.ask(Room.GetDescription())(5 second).map({
+    CurrentRoom.reference.ask(Room.GetDescription())(5 second).map({
       case Room.GetDescriptionResult(description) =>
         context.actorOf(Props(classOf[CharacterLookCollector], self, description))
     })
@@ -156,6 +170,10 @@ class Character(name: String, var room: ActorRef)
           case CharacterParsers.Walk(direction) =>
             walk(direction)
             goto(WalkPending)
+
+          case CharacterParsers.Say(message) =>
+            CurrentRoom.reference ! Character.Message(CharacterMessageCategory.Say, self, description(), message)
+            stay()
         }
       } else {
         write("What?")
@@ -174,10 +192,10 @@ class Character(name: String, var room: ActorRef)
   }
 
   when (WalkPending) {
-    case Event(Character.WalkResult(Some(to)), DataNone) =>
-      room ! Room.CharacterLeave(self)
-      to ! Room.CharacterEnter(self)
-      room = to
+    case Event(Character.WalkResult(Some(room)), DataNone) =>
+      CurrentRoom.reference ! Room.CharacterLeave(self)
+      room ! Room.CharacterEnter(self)
+      CurrentRoom.reference = room
       look()
       goto(LookPending)
 
@@ -195,6 +213,13 @@ class Character(name: String, var room: ActorRef)
       stay()
     case Event(Character.GetDescription(), _) =>
       sender() ! Character.GetDescriptionResult(description())
+      stay()
+    case Event(Character.Message(category, sender, description, message), _) =>
+      if (self == sender) {
+        write("You say: %s".format(message.capitalize))
+      } else {
+        write("%s says: %s".format(description.name.capitalize, message.capitalize))
+      }
       stay()
   }
 }
