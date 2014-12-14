@@ -5,6 +5,7 @@ import java.net.InetSocketAddress
 import akka.actor._
 import akka.io.{IO, Tcp}
 import akka.util.Timeout
+import se.netcat.dungeon.Character.{GetBriefDescriptionResult, GetBriefDescription}
 
 import scala.collection.mutable
 import scala.util.parsing.combinator.RegexParsers
@@ -78,7 +79,7 @@ object DungeonParsers extends DungeonParsers {
 }
 
 trait ConnectionParsers extends RegexParsers {
-  def name: Parser[String] = "[a-z]+".r
+  def name: Parser[String] = "[a-zA-Z]+".r ^^ { _.toLowerCase }
 
   def yes: Parser[Boolean] = "yes" ^^^ true
   def no: Parser[Boolean] = "no" ^^^ false
@@ -128,12 +129,48 @@ object CharacterState extends Enumeration {
 object CharacterData {
   sealed trait Data
 
-  final case class DataNone() extends Data
+  case object DataNone extends Data
 }
 
 object Character {
   case class Connect(connection: ActorRef)
   case class Disconnect(connection: ActorRef)
+
+  case class GetBriefDescription()
+  case class GetBriefDescriptionResult(data: String)
+
+  case class LookRoomResult(description: String, characters: Iterable[String])
+}
+
+class CharacterLookRoomCollector(character: ActorRef, input: Room.GetDataResult) extends LoggingFSM[Option[Nothing], Option[Nothing]] {
+  val characters = mutable.Map[ActorRef, Option[String]]()
+
+  startWith(None, None)
+
+  override def preStart(): Unit = {
+    for (character <- input.characters) {
+      characters.put(character, Option.empty)
+      character ! Character.GetBriefDescription()
+    }
+  }
+
+  def check() = {
+    if (characters.values.forall(_.isDefined)) {
+      character ! Character.LookRoomResult(input.description, characters.values.flatten)
+      stop()
+    } else {
+      stay()
+    }
+  }
+
+  when (None, stateTimeout = 5 second) {
+    case Event(Character.GetBriefDescriptionResult(data), _) =>
+      characters.update(sender(), Option(data))
+      check()
+    case Event(StateTimeout, _) =>
+      character ! Character.LookRoomResult("Everything is black around you.", List())
+      stop()
+  }
 }
 
 class Character(name: String, var room: ActorRef)
@@ -144,39 +181,52 @@ class Character(name: String, var room: ActorRef)
 
   val connections: mutable.HashSet[ActorRef] = mutable.HashSet()
 
-  startWith(Idle, DataNone())
+  startWith(Idle, DataNone)
 
   def write(line: String) = for (connection <- connections) {
     connection ! Player.OutgoingMessage(line)
   }
 
   override def preStart(): Unit = {
-    room ! Room.CharacterEnter(name, self)
+    room ! Room.CharacterEnter(self)
   }
 
   override def postStop(): Unit = {
-    room ! Room.CharacterLeave(name)
+    room ! Room.CharacterLeave(self)
   }
 
   when (Idle) {
-    case Event(DungeonParsers.Walk(direction), DataNone()) =>
+    case Event(DungeonParsers.Walk(direction), DataNone) =>
       write("You enjoy walking in the sun!")
       stay()
-    case Event(DungeonParsers.Look(direction), DataNone()) =>
+    case Event(DungeonParsers.Look(direction), DataNone) =>
       implicit val timeout = Timeout(5.second)
       room.ask(Room.GetData()).map({
-        case Room.GetDataResult(description, characters) =>
-          Player.OutgoingMessage(description)
-      }).pipeTo(self)
-      stay()
+        case result @ Room.GetDataResult(_, _, _) =>
+          context.actorOf(Props(classOf[CharacterLookRoomCollector], self, result))
+        })
+      goto(LookPending)
+  }
+
+  when (LookPending) {
+    case Event(Character.LookRoomResult(description, characters), DataNone) =>
+      write(description)
+      for (character <- characters) {
+        write(character)
+      }
+      goto(Idle)
   }
 
   whenUnhandled {
-    case Event(Character.Connect(connection), DataNone()) =>
+    case Event(Character.Connect(connection), _) =>
       connections += connection
       stay()
-    case Event(Character.Disconnect(connection), DataNone()) =>
+    case Event(Character.Disconnect(connection), _) =>
       connections -= connection
+      stay()
+    case Event(Character.GetBriefDescription(), _) =>
+      val description = "%s the furry creature.".format(name.capitalize)
+      sender() ! Character.GetBriefDescriptionResult(description)
       stay()
     case Event(Player.OutgoingMessage(data), _) =>
       write(data)
@@ -186,10 +236,10 @@ class Character(name: String, var room: ActorRef)
 
 object Room {
   case class GetData()
-  case class GetDataResult(description: String, characters: Iterable[String])
+  case class GetDataResult(description: String, characters: Set[ActorRef], exits: Map[Direction.Value, ActorRef])
 
-  case class CharacterEnter(name: String, character: ActorRef)
-  case class CharacterLeave(name: String)
+  case class CharacterEnter(character: ActorRef)
+  case class CharacterLeave(character: ActorRef)
 }
 
 class Room extends Actor {
@@ -197,11 +247,12 @@ class Room extends Actor {
 
   val description = "This is a plain room with no exits."
 
-  val characters = mutable.HashMap[String, ActorRef]()
+  val characters = mutable.Set[ActorRef]()
+  val exits = mutable.Map[Direction.Value, ActorRef]()
 
   override def receive: Actor.Receive = {
-    case GetData() => sender ! GetDataResult(description, characters.keys)
-    case CharacterEnter(name, character) => characters += ((name, character))
-    case CharacterLeave(name) => characters -= name
+    case GetData() => sender ! GetDataResult(description, characters.toSet, exits.toMap)
+  case CharacterEnter(character) => characters += character
+  case CharacterLeave(character) => characters -= character
   }
 }
