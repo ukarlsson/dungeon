@@ -8,12 +8,18 @@ import scala.concurrent.duration._
 import scala.util.parsing.combinator.RegexParsers
 
 trait PlayerParsers extends RegexParsers {
+  import PlayerParsers._
+
   def name: Parser[String] = "[a-zA-Z]+".r ^^ { _.toLowerCase }
 
   def yes: Parser[Boolean] = "yes" ^^^ true
   def no: Parser[Boolean] = "no" ^^^ false
 
+  def exit: Parser[Exit] = "exit" ^^^ Exit()
+
   def boolean: Parser[Boolean] = yes | no
+
+  def command: Parser[Command] = exit
 }
 
 object PlayerParsers extends PlayerParsers {
@@ -128,21 +134,15 @@ abstract class Player(connection: ActorRef, characters: ActorRef)
 
   when (Play, stateTimeout = 3600 second) {
     case Event(Player.IncomingMessage(data), DataPlaying(character)) =>
-      val command = CharacterParsers.parse(CharacterParsers.command, data)
+      val command = PlayerParsers.parse(PlayerParsers.command, data)
 
       if (command.successful) {
         command.get match {
-          case message @ CharacterParsers.Look(direction) =>
-            character ! message
-            stay()
-          case message @ CharacterParsers.Walk(direction) =>
-            character ! message
-            stay()
-          case CharacterParsers.Exit() =>
+          case PlayerParsers.Exit() =>
             goto(CharacterLogin).using(DataNone())
         }
       } else {
-        send("?SYNTAX ERROR")
+        character ! Player.IncomingMessage(data)
         stay()
       }
     case Event(Player.OutgoingMessage(data), _) =>

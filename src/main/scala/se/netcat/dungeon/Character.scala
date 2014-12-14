@@ -5,7 +5,9 @@ import java.net.InetSocketAddress
 import akka.actor._
 import akka.io.{IO, Tcp}
 import akka.util.Timeout
+import se.netcat.dungeon.Character.Description
 
+import scala.collection
 import scala.collection.mutable
 import scala.util.parsing.combinator.RegexParsers
 import akka.pattern._
@@ -24,20 +26,17 @@ trait CharacterParsers extends RegexParsers {
     case _ ~ None => Look(None)
   }
 
-  def walk: Parser[Walk] = "walk" ~ direction ^^ {
-    case _ ~ v => Walk(v)
+  def walk: Parser[Walk] = direction ^^ {
+    case v => Walk(v)
   }
 
-  def exit: Parser[Exit] = "exit" ^^^ Exit()
-
-  def command: Parser[Command] = look | walk | exit
+  def command: Parser[Command] = look | walk
 }
 
 object CharacterParsers extends CharacterParsers {
   sealed trait Command
   case class Look(direction: Option[Direction.Value]) extends Command
   case class Walk(direction: Direction.Value) extends Command
-  case class Exit() extends Command
 }
 object Characters {
   case class CreateCharacter(name: String)
@@ -70,7 +69,8 @@ object Character {
 
   case class Description(brief: String, complete: String)
 
-  case class LookRoomResult(description: Room.Description, characters: Iterable[Character.Description])
+  case class LookRoomResult(description: Room.Description, characters: Map[ActorRef, Character.Description])
+  case class WalkResult(to: Option[ActorRef])
 }
 
 class CharacterLookCollector(character: ActorRef, input: Room.Description) extends LoggingFSM[Option[Nothing], Option[Nothing]] {
@@ -87,7 +87,7 @@ class CharacterLookCollector(character: ActorRef, input: Room.Description) exten
 
   def check() = {
     if (characters.values.forall(_.isDefined)) {
-      character ! Character.LookRoomResult(input, characters.values.flatten)
+      character ! Character.LookRoomResult(input, characters.mapValues(v => v.get).toMap)
       stop()
     } else {
       stay()
@@ -99,7 +99,7 @@ class CharacterLookCollector(character: ActorRef, input: Room.Description) exten
       characters.update(sender(), Option(result.description))
       check()
     case Event(StateTimeout, _) =>
-      character ! Character.LookRoomResult(input, characters.values.flatten)
+      character ! Character.LookRoomResult(input, Map())
       stop()
   }
 }
@@ -131,28 +131,58 @@ class Character(name: String, var room: ActorRef)
     room ! Room.CharacterLeave(self)
   }
 
+  def walk(direction : Direction.Value) =
+    room.ask(Room.GetDescription())(5 second).map({
+      case Room.GetDescriptionResult(description) =>
+        self ! Character.WalkResult(description.exits.get(direction))
+    })
+
+  def look() =
+    room.ask(Room.GetDescription())(5 second).map({
+      case Room.GetDescriptionResult(description) =>
+        context.actorOf(Props(classOf[CharacterLookCollector], self, description))
+    })
+
   when (Idle) {
-    case Event(CharacterParsers.Walk(direction), DataNone) =>
-      write("You enjoy walking in the sun!")
-      stay()
-    case Event(CharacterParsers.Look(direction), DataNone) =>
-      implicit val timeout = Timeout(5.second)
-      room.ask(Room.GetDescription()).map({
-        case Room.GetDescriptionResult(description @ _) =>
-          context.actorOf(Props(classOf[CharacterLookCollector], self, description))
-        })
-      goto(LookPending)
-    case Event(CharacterParsers.Walk(direction), DataNone) =>
-      stay()
+    case Event(Player.IncomingMessage(data), DataNone) =>
+      val command = CharacterParsers.parse(CharacterParsers.command, data)
+
+      if (command.successful) {
+        command.get match {
+          case CharacterParsers.Look(direction) =>
+            look()
+            goto(LookPending)
+
+          case CharacterParsers.Walk(direction) =>
+            walk(direction)
+            goto(WalkPending)
+        }
+      } else {
+        write("What?")
+        stay()
+      }
   }
 
   when (LookPending) {
     case Event(Character.LookRoomResult(description, characters), DataNone) =>
       write(description.brief)
-      for (character <- characters) {
+      for (character <- (characters - self).values) {
         write(character.brief)
       }
       write("The obvious exits are: %s".format(description.exits.keys.mkString(", ")))
+      goto(Idle)
+  }
+
+  when (WalkPending) {
+    case Event(Character.WalkResult(Some(to)), DataNone) =>
+      room ! Room.CharacterLeave(self)
+      to ! Room.CharacterEnter(self)
+      room = to
+      look()
+      goto(LookPending)
+
+    case Event(Character.WalkResult(None), DataNone) =>
+      write("Ouch that hurts!")
       goto(Idle)
   }
 
@@ -165,9 +195,6 @@ class Character(name: String, var room: ActorRef)
       stay()
     case Event(Character.GetDescription(), _) =>
       sender() ! Character.GetDescriptionResult(description())
-      stay()
-    case Event(Player.OutgoingMessage(data), _) =>
-      write(data)
       stay()
   }
 }
