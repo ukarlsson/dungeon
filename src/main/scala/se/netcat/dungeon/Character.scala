@@ -138,11 +138,11 @@ class Character(name: String, val start: ActorRef)
   }
 
   override def preStart(): Unit = {
-    CurrentRoom.reference ! Room.CharacterEnter(self)
+    CurrentRoom.reference ! Room.CharacterEnter(self, description())
   }
 
   override def postStop(): Unit = {
-    CurrentRoom.reference ! Room.CharacterLeave(self)
+    CurrentRoom.reference ! Room.CharacterLeave(self, description())
   }
 
   def walk(direction : Direction.Value) =
@@ -193,8 +193,8 @@ class Character(name: String, val start: ActorRef)
 
   when (WalkPending) {
     case Event(Character.WalkResult(Some(room)), DataNone) =>
-      CurrentRoom.reference ! Room.CharacterLeave(self)
-      room ! Room.CharacterEnter(self)
+      CurrentRoom.reference ! Room.CharacterLeave(self, description())
+      room ! Room.CharacterEnter(self, description())
       CurrentRoom.reference = room
       look()
       goto(LookPending)
@@ -219,6 +219,16 @@ class Character(name: String, val start: ActorRef)
         write("You say: %s".format(message.capitalize))
       } else {
         write("%s says: %s".format(description.name.capitalize, message.capitalize))
+      }
+      stay()
+    case Event(Room.CharacterEnter(character, description), _) =>
+      if (self != character) {
+        write("%s enters the room.".format(description.name.capitalize))
+      }
+      stay()
+    case Event(Room.CharacterLeave(character, description), _) =>
+      if (self != character) {
+        write("%s leaves the room.".format(description.name.capitalize))
       }
       stay()
   }

@@ -22,9 +22,17 @@ class Room(brief: String, exits: () => Map[Direction.Value, ActorRef]) extends A
 
   override def receive: Actor.Receive = {
     case GetDescription() => sender ! GetDescriptionResult(description())
-    case CharacterEnter(character) => characters += character
-    case CharacterLeave(character) => characters -= character
-    case message @ Character.Message(_, _, _) =>
+    case message @ CharacterEnter(character, description) =>
+      characters += character
+      for (character <- characters) {
+        character ! message
+      }
+    case message @ CharacterLeave(character, description) =>
+      for (character <- characters) {
+        character ! message
+      }
+      characters -= character
+    case message @ Character.Message(_, _, _, _) =>
       for (character <- characters) {
         character ! message
       }
@@ -35,8 +43,8 @@ object Room {
   case class GetDescription()
   case class GetDescriptionResult(description: Description)
 
-  case class CharacterEnter(character: ActorRef)
-  case class CharacterLeave(character: ActorRef)
+  case class CharacterEnter(character: ActorRef, description: Character.Description)
+  case class CharacterLeave(character: ActorRef, description: Character.Description)
 
   case class Description(brief: String, complete: String, characters: Set[ActorRef], exits: Map[Direction.Value, ActorRef])
 }

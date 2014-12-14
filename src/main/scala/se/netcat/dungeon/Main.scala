@@ -9,10 +9,13 @@ object Main extends App {
   implicit val system = ActorSystem("netcat")
 
   lazy val room1 : ActorRef = system.actorOf(Props(classOf[Room], "This is a plain room.",
-    () => Map((Direction.South, room2))), "room1")
+    () => Map((Direction.South, room2), (Direction.East, room3))))
 
   lazy val room2 : ActorRef = system.actorOf(Props(classOf[Room], "This is another plain room",
-    () => Map((Direction.North, room1))), "room2")
+    () => Map((Direction.North, room1))))
+
+  lazy val room3 : ActorRef = system.actorOf(Props(classOf[Room], "This is the Dark Room",
+    () => Map((Direction.West, room1))))
 
   val characters = system.actorOf(Props(classOf[Characters], room1), "characters")
 
