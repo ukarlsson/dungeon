@@ -128,25 +128,30 @@ abstract class Player(connection: ActorRef, characters: ActorRef, resolver: Acto
     case Event(Player.IncomingMessage(data), DataLogin(None, None)) =>
       PlayerParsers.parse(PlayerParsers.name, data) match {
         case PlayerParsers.Success(name, _) =>
-          resolver ! CharacterByNameResolver.Get(name)
+          resolver ! CharacterResolver.GetRequest(name)
           stay().using(DataLogin(Some(name), None))
         case PlayerParsers.Failure(_, _) =>
+          send("Parse error.")
           goto(Start).using(DataNone())
       }
 
-    case Event(CharacterByNameResolver.GetResult(result), DataLogin(Some(name), None)) =>
+    case Event(CharacterResolver.GetResponse(result), DataLogin(Some(name), None)) =>
       result match {
         case Some(uuid) =>
-          characters ! CharacterSupervisor.Get(uuid)
+          characters ! CharacterManager.GetRequest(uuid)
           stay().using(DataLogin(Some(name), Some(uuid)))
         case None =>
+          send("Unable to resolve character.")
           goto(Start).using(DataNone())
       }
 
-    case Event(CharacterSupervisor.GetResult(result), DataLogin(Some(name), Some(uuid))) =>
+    case Event(CharacterManager.GetResponse(result), DataLogin(Some(name), Some(uuid))) =>
       result match {
-        case Some(character) => goto(Play).using(DataPlaying(character))
-        case None => goto(Start).using(DataNone())
+        case Some(character) =>
+          goto(Play).using(DataPlaying(character))
+        case None =>
+          send("Unable lo locate character.")
+          goto(Start).using(DataNone())
       }
   }
 
@@ -155,24 +160,24 @@ abstract class Player(connection: ActorRef, characters: ActorRef, resolver: Acto
       PlayerParsers.parse(PlayerParsers.name, data) match {
         case PlayerParsers.Success(name, _) =>
           val uuid = UUID.randomUUID()
-          resolver ! CharacterByNameResolver.Set(name, uuid)
+          resolver ! CharacterResolver.SetRequest(name, uuid)
           stay().using(DataCreate(Some(name), Some(uuid), resolved = false))
         case PlayerParsers.Failure(_, _) =>
           send("That is not a valid name!")
           goto(Start).using(DataNone())
       }
 
-    case Event(CharacterByNameResolver.SetResult(result), DataCreate(Some(name), Some(uuid), false)) =>
+    case Event(CharacterResolver.SetResponse(result), DataCreate(Some(name), Some(uuid), false)) =>
       result match {
         case true =>
-          characters ! CharacterSupervisor.Create(uuid)
+          characters ! CharacterManager.CreateRequest(uuid)
           stay().using(DataCreate(Some(name), Some(uuid), resolved = true))
         case false =>
           send("That name is already used!")
           goto(Start).using(DataNone())
       }
 
-    case Event(CharacterSupervisor.CreateResult(result), DataCreate(Some(name), Some(uuid), true)) =>
+    case Event(CharacterManager.CreateResponse(result), DataCreate(Some(name), Some(uuid), true)) =>
       result match {
         case Some(character) =>
           goto(Play).using(DataPlaying(character))

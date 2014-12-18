@@ -6,9 +6,8 @@ import akka.actor._
 import akka.event.LoggingReceive
 import akka.pattern._
 import akka.persistence.{PersistentActor, SnapshotOffer}
-import se.netcat.dungeon.Room.CharacterEnter
+import se.netcat.dungeon.Implicits.{convertUUIDToString, convertPairToPath}
 
-import scala.collection.mutable
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration._
 import scala.util.parsing.combinator.RegexParsers
@@ -24,6 +23,8 @@ object CharacterParsers extends CharacterParsers {
   case class Say(line: String) extends Command
 
   case class Sleep() extends Command
+
+  case class Create() extends Command
 
 }
 
@@ -55,7 +56,11 @@ trait CharacterParsers extends RegexParsers {
     Sleep()
   }
 
-  def command: Parser[Command] = look | walk | say | sleep
+  def create: Parser[Create] = "create" ^^^ {
+    Create()
+  }
+
+  def command: Parser[Command] = look | walk | say | sleep | create
 }
 
 object CharacterStateData {
@@ -83,11 +88,13 @@ object CharacterState extends Enumeration {
   val LookPending = Value
   val WalkPending = Value
   val SleepPending = Value
+  val CreatePending = Value
 }
 
 object Character {
 
-  def props(uuid: UUID, dungeon: ActorRef) = Props(new Character(uuid = uuid, dungeon = dungeon))
+  def props(id: UUID, rooms: ActorRef, items: ActorRef) =
+    Props(new Character(id = id, rooms = rooms, items = items))
 
   case class Connect(connection: ActorRef)
 
@@ -112,43 +119,39 @@ object Character {
 class CharacterLookCollector(character: ActorRef, input: Room.Description)
   extends LoggingFSM[Option[Nothing], Option[Nothing]] {
 
-  val characters = mutable.Map[ActorRef, Option[Character.BasicDescription]]()
+  var characters = Map[ActorRef, Option[Character.BasicDescription]]()
+
+  for (character <- input.characters) {
+    characters += character -> Option.empty
+    character ! Character.GetDescription()
+  }
 
   startWith(None, None)
 
-  override def preStart(): Unit = {
-    for (character <- input.characters) {
-      characters.put(character, Option.empty)
-      character ! Character.GetDescription()
-    }
-  }
-
-  def check() = {
-    if (characters.values.forall(_.isDefined)) {
-      character ! Character.LookRoomResult(input, characters.mapValues(v => v.get).toMap)
-      stop()
-    } else {
-      stay()
-    }
-  }
-
   when(None, stateTimeout = 1 second) {
     case Event(result@Character.GetDescriptionResult(data), _) =>
-      characters.update(sender(), Option(result.description))
-      check()
+      characters += sender() -> Option(result.description)
+
+      if (!characters.values.exists(_.isEmpty)) {
+        character ! Character.LookRoomResult(input, characters.mapValues(_.get))
+        stop()
+      } else {
+        stay()
+      }
+
     case Event(StateTimeout, _) =>
       character ! Character.LookRoomResult(input, Map())
       stop()
   }
 }
 
-class Character(uuid: UUID, dungeon: ActorRef)
+class Character(id: UUID, rooms: ActorRef, items: ActorRef)
   extends LoggingFSM[CharacterState.Value, CharacterStateData.Data] with ActorLogging {
 
   import se.netcat.dungeon.CharacterState._
   import se.netcat.dungeon.CharacterStateData._
 
-  val characterData: ActorRef = context.actorOf(CharacterData.props(uuid))
+  val characterData: ActorRef = context.actorOf(CharacterData.props(id))
 
   var connections: Set[ActorRef] = Set()
 
@@ -165,7 +168,7 @@ class Character(uuid: UUID, dungeon: ActorRef)
   }
 
   override def preStart(): Unit = {
-    dungeon ! Dungeon.GetRoom(SpecialRoom.Start)
+    rooms ! RoomManager.GetRoom(SpecialRoom.Start)
   }
 
   override def postStop(): Unit = {
@@ -197,7 +200,7 @@ class Character(uuid: UUID, dungeon: ActorRef)
   }
 
   when(RoomPending) {
-    case Event(Dungeon.GetRoomResult(Some(room)), DataNone) =>
+    case Event(RoomManager.GetRoomResult(Some(room)), DataNone) =>
       room ! Room.CharacterEnter(self, description())
       location = Some(room)
       goto(Idle)
@@ -210,9 +213,17 @@ class Character(uuid: UUID, dungeon: ActorRef)
       if (command.successful) {
         command.get match {
           case CharacterParsers.Look(direction) =>
-            if (look()) goto(LookPending) else stay()
+            if (look()) {
+              goto(LookPending)
+            } else {
+              stay()
+            }
           case CharacterParsers.Walk(direction) =>
-            if (walk(direction)) goto(WalkPending) else stay()
+            if (walk(direction)) {
+              goto(WalkPending)
+            } else {
+              stay()
+            }
           case CharacterParsers.Sleep() =>
             write("You fall asleep.")
             goto(SleepPending)
@@ -220,6 +231,10 @@ class Character(uuid: UUID, dungeon: ActorRef)
             // CurrentRoom.reference !
             //   Character.Message(CharacterMessageCategory.Say, self, description(), message)
             stay()
+          case CharacterParsers.Create() =>
+            write("You start creating something.")
+            context.actorOf(CharacterItemCreator.props(id, items))
+            goto(CreatePending)
         }
       } else {
         write("What?")
@@ -259,6 +274,17 @@ class Character(uuid: UUID, dungeon: ActorRef)
       goto(Idle)
   }
 
+  when(CreatePending) {
+    case Event(CharacterItemCreator.CreateItemResponse(result), DataNone) =>
+      result match {
+        case Some(itemId) =>
+          write("You created an item.")
+        case None =>
+          write("You failed to create an item.")
+      }
+      goto(Idle)
+  }
+
   whenUnhandled {
     case Event(Character.Connect(connection), _) =>
       connections += connection
@@ -269,7 +295,7 @@ class Character(uuid: UUID, dungeon: ActorRef)
     case Event(Character.GetDescription(), _) =>
       sender() ! Character.GetDescriptionResult(description())
       stay()
-    case Event(Character.Message(category, uuid, description, message), _) =>
+    case Event(Character.Message(category, id, description, message), _) =>
       if (self == sender) {
         write("You say: %s".format(message.capitalize))
       } else {
@@ -291,152 +317,270 @@ class Character(uuid: UUID, dungeon: ActorRef)
 
 object CharacterData {
 
-  def props(uuid: UUID) = Props(new CharacterData(uuid = uuid))
+  def props(id: UUID) = Props(new CharacterData(id = id))
 
-  case class SetName(name: String)
+  case class SetNameRequest(name: String)
 
-  case class SetBrief(brief: String)
+  case class SetNameResponse()
 
-  case class SetResult(success: Boolean)
+  case class SetBriefRequest(brief: String)
 
-  case class GetBasic()
+  case class SetBriefResponse()
 
-  case class GetBasicResult(name: Option[String], brief: Option[String])
+  case class GetBasicRequest()
+
+  case class GetBasicResponse(name: Option[String], brief: Option[String])
 
   case class Snapshot()
 
 }
 
-class CharacterData(uuid: UUID) extends PersistentActor {
+class CharacterData(id: UUID) extends PersistentActor {
 
   import se.netcat.dungeon.CharacterData._
 
-  case class SnapshotDataV1(name: Option[String], brief: Option[String])
+  case class SnapshotStateV1(name: Option[String], brief: Option[String])
 
-  override def persistenceId = "character-data-%s".format(uuid)
+  override def persistenceId = "character-data-%s".format(id)
 
   var name: Option[String] = None
   var brief: Option[String] = None
 
   val receiveRecover: Receive = {
-    case SetBrief(data) => brief = Option(data)
-    case SnapshotOffer(_, snapshot: SnapshotDataV1) =>
+    case SetBriefRequest(data) => brief = Option(data)
+    case SnapshotOffer(_, snapshot: SnapshotStateV1) =>
       name = snapshot.name
       brief = snapshot.brief
   }
 
   val receiveCommand: Receive = {
-    case message@SetName(_) =>
+    case message@SetNameRequest(_) =>
       persist(message) {
-        message => name = Option(message.name)
+        message =>
+          name = Option(message.name)
+          sender() ! SetNameResponse()
       }
-    case message@SetBrief(_) =>
+    case message@SetBriefRequest(_) =>
       persist(message) {
-        message => name = Option(message.brief)
+        message =>
+          name = Option(message.brief)
+          sender() ! SetBriefResponse()
       }
-    case GetBasic() => sender() ! GetBasicResult(name, brief)
-    case Snapshot() => saveSnapshot(SnapshotDataV1(name, brief))
+    case GetBasicRequest() => sender() ! GetBasicResponse(name, brief)
+    case Snapshot() => saveSnapshot(SnapshotStateV1(name, brief))
   }
 }
 
-object CharacterSupervisor {
+object CharacterItemCreatorState extends Enumeration {
 
-  def props(dungeon: ActorRef) = Props(new CharacterSupervisor(dungeon = dungeon))
+  type CharacterItemCreaterState = Value
 
-  case class Create(uuid: UUID)
+  val PreStart = Value
+  val CreateItemPending = Value
+  val SetItemPending = Value
+}
 
-  case class CreateResult(character: Option[ActorRef])
+object CharacterItemCreator {
 
-  case class Get(uuid: UUID)
+  def props(characterId: UUID, items: ActorRef) =
+    Props(new CharacterItemCreator(id = characterId, items = items))
 
-  case class GetResult(character: Option[ActorRef])
+  case class CreateItemResponse(id: Option[UUID])
+
+  sealed trait Data
+
+  case class DataNone() extends Data
+
+  case class DataItem(item: ActorRef) extends Data
+
+  case class DataItemSetResult(owner: Boolean, basic: Boolean) extends Data
+
+}
+
+
+class CharacterItemCreator(id: UUID, items: ActorRef)
+  extends LoggingFSM[CharacterItemCreatorState.Value, CharacterItemCreator.Data] {
+
+  import se.netcat.dungeon.CharacterItemCreator._
+  import se.netcat.dungeon.CharacterItemCreatorState._
+
+  case class Start()
+
+  val itemId = UUID.randomUUID()
+
+  startWith(PreStart, DataNone())
+
+  self ! Start()
+
+  when(PreStart) {
+    case Event(Start(), DataNone()) =>
+      items ! ItemManager.CreateRequest(itemId, ItemClass.Basic)
+      goto(CreateItemPending).using(DataNone())
+  }
+
+  when(CreateItemPending) {
+    case Event(ItemManager.CreateResponse(Some(item)), DataNone()) =>
+      item ! Item.SetBasicRequest(Set("basic"), "a basic item")
+      item ! Item.SetOwnerRequest(0, Some(id))
+      goto(SetItemPending).using(DataItemSetResult(owner = false, basic = false))
+  }
+
+  when(SetItemPending) {
+    case Event(Item.SetBasicResponse(), DataItemSetResult(true, true)) =>
+      context.parent ! CreateItemResponse(Some(itemId))
+      stop()
+    case Event(Item.SetBasicResponse(), DataItemSetResult(_, _)) =>
+      stay()
+  }
+}
+
+object CharacterItems {
+
+  case class SetRequest(id: UUID)
+
+  case class SetResponse()
+
+  case class ClearRequest(id: UUID)
+
+  case class ClearResponse()
+
+  case class GetRequest()
+
+  case class GetResponse(ids: Set[UUID])
 
   case class Snapshot()
 
 }
 
-class CharacterSupervisor(dungeon: ActorRef) extends PersistentActor with ActorLogging {
+class CharacterItems(id: UUID) extends PersistentActor {
 
-  import se.netcat.dungeon.CharacterSupervisor._
+  import se.netcat.dungeon.CharacterItems._
 
-  override def persistenceId = "characters"
+  case class SnapshotStateV1(items: Set[UUID])
+
+  override def persistenceId = "character-items-%s".format(id)
+
+  var items: Set[UUID] = Set[UUID]()
+
+  val receiveRecover: Receive = {
+    case message@SetRequest(_) =>
+      items += message.id
+    case SnapshotOffer(_, snapshot: SnapshotStateV1) =>
+      items = snapshot.items
+  }
+
+  val receiveCommand: Receive = {
+    case message@SetRequest(_) =>
+      persist(message) {
+        message =>
+          items += message.id
+          sender() ! SetResponse()
+      }
+    case GetRequest() => sender() ! GetResponse(items)
+    case Snapshot() => saveSnapshot(SnapshotStateV1(items))
+  }
+}
+
+object CharacterManager {
+
+  def props(rooms: () => ActorRef, items: () => ActorRef)(implicit config: DungeonConfig) =
+    Props(new CharacterManager(rooms = rooms, items = items))
+
+  case class CreateRequest(id: UUID)
+
+  case class CreateResponse(character: Option[ActorRef])
+
+  case class GetRequest(id: UUID)
+
+  case class GetResponse(character: Option[ActorRef])
+
+  case class Snapshot()
+
+}
+
+class CharacterManager(rooms: () => ActorRef, items: () => ActorRef)(implicit config: DungeonConfig)
+  extends PersistentActor with ActorLogging {
+
+  import se.netcat.dungeon.CharacterManager._
+
+  context.actorSelection((Module.Character, UUID.randomUUID()))
+
+  override def persistenceId = "character"
 
   var characters = Map[UUID, ActorRef]()
 
   val receiveRecover: Receive = LoggingReceive {
-    case Create(uuid) =>
-      if (!characters.contains(uuid)) {
-        characters += ((uuid, context.actorOf(Character.props(uuid, dungeon), uuid.toString)))
+    case CreateRequest(id) =>
+      if (!characters.contains(id)) {
+        characters += ((id, context.actorOf(Character.props(id, rooms(), items()), id)))
       }
     case SnapshotOffer(_, snapshot: Set[UUID]) =>
-      for (uuid <- snapshot) {
-        characters += ((uuid, context.actorOf(Character.props(uuid, dungeon), uuid.toString)))
+      for (id <- snapshot) {
+        characters += ((id, context.actorOf(Character.props(id, rooms(), items()), id)))
       }
   }
 
   val receiveCommand: Receive = LoggingReceive {
-    case message@Create(_) =>
+    case message@CreateRequest(_) =>
       persist(message) {
-        case Create(uuid) =>
-          if (!characters.contains(uuid)) {
-            characters += ((uuid, context.actorOf(Character.props(uuid, dungeon), uuid.toString)))
-            sender() ! CreateResult(Option(characters(uuid)))
-          } else {
-            sender() ! CreateResult(None)
+        case CreateRequest(id) =>
+          if (!characters.contains(id)) {
+            characters += ((id, context.actorOf(Character.props(id, rooms(), items()), id)))
           }
+          sender() ! CreateResponse(characters.get(id))
       }
 
-    case Get(uuid) => sender() ! GetResult(characters.get(uuid))
+    case GetRequest(id) => sender() ! GetResponse(characters.get(id))
 
-    case CharacterSupervisor.Snapshot() => saveSnapshot(characters.keys.toSet)
+    case CharacterManager.Snapshot() => saveSnapshot(characters.keys.toSet)
   }
 }
 
 
-object CharacterByNameResolver {
+object CharacterResolver {
 
-  def props() = Props(new CharacterByNameResolver())
+  def props() = Props(new CharacterResolver())
 
-  case class Set(name: String, uuid: UUID)
+  case class SetRequest(name: String, id: UUID)
 
-  case class SetResult(success: Boolean)
+  case class SetResponse(success: Boolean)
 
-  case class Get(name: String)
+  case class GetRequest(name: String)
 
-  case class GetResult(uuid: Option[UUID])
+  case class GetResponse(id: Option[UUID])
 
 }
 
-class CharacterByNameResolver extends PersistentActor with ActorLogging {
+class CharacterResolver extends PersistentActor with ActorLogging {
 
-  override def persistenceId = "character-by-name-resolver"
+  override def persistenceId = "character-resolver"
 
-  import se.netcat.dungeon.CharacterByNameResolver._
+  import se.netcat.dungeon.CharacterResolver._
 
-  var map = Map[String, UUID]()
+  var state = Map[String, UUID]()
 
   val receiveRecover: Receive = LoggingReceive {
-    case Set(name, uuid) =>
-      if (!map.contains(name)) {
-        map += ((name, uuid))
+    case SetRequest(name, id) =>
+      if (!state.contains(name)) {
+        state += ((name, id))
       }
     case SnapshotOffer(_, snapshot: (Map[String, UUID])) =>
-      map = snapshot
+      state = snapshot
   }
 
   val receiveCommand: Receive = LoggingReceive {
-    case message@Set(_, _) =>
+    case message@SetRequest(_, _) =>
       persist(message) {
-        case Set(name, uuid) =>
-          if (!map.contains(name)) {
-            map += ((name, uuid))
-            sender() ! SetResult(success = true)
+        case SetRequest(name, id) =>
+          if (!state.contains(name)) {
+            state += ((name, id))
+            sender() ! SetResponse(success = true)
           } else {
-            sender() ! SetResult(success = false)
+            sender() ! SetResponse(success = false)
           }
       }
-    case Get(name) => sender() ! GetResult(map.get(name))
+    case GetRequest(name) => sender() ! GetResponse(state.get(name))
 
-    case CharacterSupervisor.Snapshot() => saveSnapshot(map)
+    case CharacterManager.Snapshot() => saveSnapshot(state)
   }
 }

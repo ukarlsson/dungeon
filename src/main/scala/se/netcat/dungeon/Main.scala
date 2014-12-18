@@ -1,10 +1,15 @@
 package se.netcat.dungeon
 
+import java.io.{ObjectOutputStream, ByteArrayOutputStream}
 import java.net.InetSocketAddress
+import java.util.UUID
 
 import akka.actor._
 import akka.event.LoggingReceive
 import akka.io.{IO, Tcp}
+
+import Implicits.convertUUIDToString
+import Implicits.convertPairToPath
 
 object SpecialRoom extends Enumeration {
   type SpecialRoom = Value
@@ -12,24 +17,67 @@ object SpecialRoom extends Enumeration {
   val Start = Value
 }
 
+object Module extends Enumeration {
+  type Module = Value
+
+  var Character = Value
+  var Item = Value
+  var Room = Value
+}
+
 object Main extends App {
   implicit val system = ActorSystem("netcat")
 
-  val dungeon = system.actorOf(Dungeon.props(), "dungeon")
+  implicit val config = DungeonConfig(
+    modules = Map(
+      Module.Character -> "characters",
+      Module.Item -> "items",
+      Module.Room -> "rooms"
+    ),
+    system = system
+  )
 
-  val characters = system.actorOf(CharacterSupervisor.props(dungeon = dungeon), "characters")
+  system.actorSelection(Module.Character, UUID.randomUUID())
+  /*
 
-  val resolver = system.actorOf(CharacterByNameResolver.props(), "resolver")
+  lazy val rooms: ActorRef = system.actorOf(RoomManager.props(), config.modules(Module.Room))
 
-  val server = system.actorOf(Server.props(characters = characters, resolver = resolver), "server")
+  lazy val characters: ActorRef = system.actorOf(CharacterManager.props(rooms = () => rooms, items = () => items), config.modules(Module.Character))
+
+  lazy val items: ActorRef = system.actorOf(ItemManager.props(rooms = () => rooms, characters = () => characters), config.modules(Module.Item))
+
+  val resolver: ActorRef = system.actorOf(CharacterResolver.props(), "character-resolver")
+
+  val server: ActorRef = system.actorOf(Server.props(characters = () => characters, resolver = resolver), "server")
+
+  (rooms, characters, items)
+  */
+
+  trait Trait {
+    case class InTrait()
+  }
+  object Object extends Trait {
+    case class InObject(v: Int)
+  }
+
+
+  val o1 = Object.InTrait()
+  val o2 = Object.InObject(1)
+
+  o2.getClass
+
+  val bos = new ByteArrayOutputStream
+  val out = new ObjectOutputStream(bos)
+  out.writeObject(o1)
+  out.writeObject(o2)
 }
 
 object Server {
-  def props(characters: ActorRef, resolver: ActorRef) = Props(
+  def props(characters: () => ActorRef, resolver: ActorRef) = Props(
     new Server(characters = characters, resolver = resolver))
 }
 
-class Server(characters: ActorRef, resolver: ActorRef) extends Actor {
+class Server(characters: () => ActorRef, resolver: ActorRef) extends Actor with ActorLogging {
   import akka.io.Tcp.{Bind, Bound, CommandFailed, Connected, Register}
 
   implicit val system = context.system
@@ -37,41 +85,17 @@ class Server(characters: ActorRef, resolver: ActorRef) extends Actor {
   IO(Tcp) ! Bind(self, new InetSocketAddress("localhost", 30000))
 
   override def receive: Receive = {
-    case bound @ Bound(localAddress) => println(localAddress)
+    case bound @ Bound(localAddress) =>
+      log.info("Successfully bound to %s".format(localAddress))
 
     case CommandFailed(_ : Bind) => context.stop(self)
 
     case Connected(remote, local) =>
       val connection = sender()
       val player = context.actorOf(TcpPlayer.props(
-        connection = connection, characters = characters, resolver = resolver))
+        connection = connection, characters = characters(), resolver = resolver),
+        "%s:%d".format(remote.getHostName, remote.getPort))
       connection ! Register(player)
-  }
-}
-
-object Dungeon {
-  def props() = Props(new Dungeon())
-
-  case class GetRoom(value: SpecialRoom.Value)
-  case class GetRoomResult(room: Option[ActorRef])
-}
-
-class Dungeon() extends Actor {
-  import Dungeon._
-
-  lazy val room1 : ActorRef = context.actorOf(Room.props("This is a plain room.",
-    () => Map((Direction.South, room2), (Direction.East, room3))))
-
-  lazy val room2 : ActorRef = context.actorOf(Room.props("This is another plain room",
-    () => Map((Direction.North, room1))))
-
-  lazy val room3 : ActorRef = context.actorOf(Room.props("This is the Dark Room",
-    () => Map((Direction.West, room1))))
-
-  val rooms = Map((SpecialRoom.Start, room1))
-
-  override def receive: Actor.Receive = LoggingReceive {
-    case GetRoom(value) => sender() ! GetRoomResult(rooms.get(value))
   }
 }
 

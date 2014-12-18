@@ -4,7 +4,7 @@ organization := "netcat"
 
 version := "1.0"
 
-scalaVersion := "2.11.1"
+scalaVersion := "2.11.4"
 
 scalacOptions := Seq("-encoding", "utf8",
                      "-target:jvm-1.7",
@@ -33,6 +33,7 @@ libraryDependencies ++= {
     "ch.qos.logback"          %   "logback-classic"        % "1.0.12",
     "com.typesafe.akka"       %%  "akka-testkit"           % akkaVersion    % "test",
     "org.specs2"              %%  "specs2"                 % "2.3.13"        % "test",
-    "org.scala-lang.modules" %% "scala-parser-combinators" % "1.0.2"
+    "org.scala-lang.modules" %% "scala-parser-combinators" % "1.0.2",
+     "io.spray"               %% "spray-json"              % "1.3.1"
   )
 }
