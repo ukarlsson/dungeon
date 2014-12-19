@@ -9,19 +9,11 @@ import se.netcat.dungeon.Implicits.convertUUIDToString
 
 trait ItemDataCommon {
 
-  case class SetBasicRequest(handles: Set[String], brief: String)
-
-  case class SetBasicResponse()
-
-  case class GetBasicRequest()
-
-  case class GetBasicResponse(handles: Set[String], brief: Option[String])
-
 }
 
 object ItemData extends ItemDataCommon {
 
-  def props(id: UUID) = Props(new CharacterData(id = id))
+  def props(id: UUID) = Props(new ItemData(id = id))
 
   case class Snapshot()
 
@@ -30,6 +22,7 @@ object ItemData extends ItemDataCommon {
 class ItemData(id: UUID) extends PersistentActor {
 
   import se.netcat.dungeon.ItemData._
+  import se.netcat.dungeon.Item._
 
   override def persistenceId: String = "item-data-%s".format(id)
 
@@ -39,36 +32,28 @@ class ItemData(id: UUID) extends PersistentActor {
   case class SnapshotStateV1(handles: Set[String], brief: Option[String])
 
   val receiveRecover: Receive = LoggingReceive {
-    case message@SetBasicRequest(_, _) =>
+    case message@SetDataRequest(_, _) =>
       handles = message.handles
-      brief = Some(message.brief)
+      brief = message.brief
     case SnapshotOffer(_, snapshot: SnapshotStateV1) =>
       handles = snapshot.handles
       brief = snapshot.brief
   }
 
   val receiveCommand: Receive = LoggingReceive {
-    case message@SetBasicRequest(_, _) =>
+    case message@SetDataRequest(_, _) =>
       persist(message) {
         message =>
           handles = message.handles
-          brief = Some(message.brief)
-          sender() ! SetBasicResponse()
+          brief = message.brief
+          sender() ! SetDataResponse()
       }
-    case GetBasicRequest() => sender() ! GetBasicResponse(handles, brief)
+    case GetDataRequest() => sender() ! GetDataResponse(handles, brief)
     case Snapshot() => saveSnapshot(SnapshotStateV1(handles, brief))
   }
 }
 
 trait ItemOwnerCommon {
-
-  case class SetOwnerRequest(sequence: Long, owner: Option[UUID])
-
-  case class SetOwnerResponse(success: Boolean)
-
-  case class GetOwnerRequest()
-
-  case class GetOwnerResponse(sequence: Long, owner: Option[UUID])
 
 }
 
@@ -84,6 +69,7 @@ object ItemOwner extends ItemOwnerCommon {
 class ItemOwner(id: UUID, characters: ActorRef) extends PersistentActor {
 
   import se.netcat.dungeon.ItemOwner._
+  import se.netcat.dungeon.Item._
 
   override def persistenceId: String = "item-owner-%s".format(id)
 
@@ -94,9 +80,8 @@ class ItemOwner(id: UUID, characters: ActorRef) extends PersistentActor {
 
   val receiveRecover: Receive = LoggingReceive {
     case message@SetOwnerRequest(_, _) =>
-      if (message.sequence == sequence) {
-        owner = message.owner
-      }
+      sequence += 1
+      owner = message.owner
     case SnapshotOffer(_, snapshot: SnapshotStateV1) =>
       sequence = snapshot.sequence
       owner = snapshot.owner
@@ -104,14 +89,15 @@ class ItemOwner(id: UUID, characters: ActorRef) extends PersistentActor {
 
   val receiveCommand: Receive = LoggingReceive {
     case message@SetOwnerRequest(_, _) =>
-      persist(message) {
-        message =>
-          if (message.sequence == sequence) {
+      if (message.sequence == sequence) {
+        persist(message) {
+          message =>
+            sequence += 1
             owner = message.owner
             sender() ! SetOwnerResponse(success = true)
-          } else {
-            sender() ! SetOwnerResponse(success = false)
-          }
+        }
+      } else {
+        sender() ! SetOwnerResponse(success = false)
       }
     case GetOwnerRequest() => sender() ! GetOwnerResponse(sequence, owner)
     case Snapshot() => saveSnapshot(SnapshotStateV1(sequence, owner))
@@ -126,12 +112,32 @@ object ItemBasicState extends Enumeration {
 }
 
 object Item extends ItemDataCommon with ItemOwnerCommon {
-  val ItemClassMap: Map[ItemClass.Value, Class[_ <: Item ]] = Map(
+
+  val ItemClassMap: Map[ItemClass.Value, Class[_ <: Item]] = Map(
     ItemClass.Basic -> classOf[ItemBasic]
   )
 
   def props(clazz: ItemClass.Value, id: UUID, characters: ActorRef) =
     Props(ItemClassMap(clazz), id, characters)
+
+  case class SetOwnerRequest(sequence: Long, owner: Option[UUID])
+
+  case class SetOwnerResponse(success: Boolean)
+
+  case class GetOwnerRequest()
+
+  case class GetOwnerResponse(sequence: Long, owner: Option[UUID])
+
+  case class SetDataRequest(handles: Set[String], brief: Option[String])
+
+  case class SetDataResponse()
+
+  case class GetDataRequest()
+
+  case class GetDataResponse(handles: Set[String], brief: Option[String])
+
+  case class Data(handles: Set[String], brief: Option[String])
+
 }
 
 abstract class Item
@@ -141,8 +147,8 @@ class ItemBasic(id: UUID, characters: ActorRef)
 
   import se.netcat.dungeon.ItemBasicState._
 
-  val data = context.actorOf(ItemData.props(id), "data")
   val owner = context.actorOf(ItemOwner.props(id, characters), "owner")
+  val data = context.actorOf(ItemData.props(id), "data")
 
   startWith(Start, None)
 
@@ -152,17 +158,17 @@ class ItemBasic(id: UUID, characters: ActorRef)
   }
 
   whenUnhandled {
-    case Event(message@Item.SetBasicRequest(_, _), _) =>
-      data.tell(message, sender())
+    case Event(message@Item.SetDataRequest(_, _), _) =>
+      data.forward(message)
       stay()
-    case Event(message@Item.GetBasicRequest(), _) =>
-      data.tell(message, sender())
+    case Event(message@Item.GetDataRequest(), _) =>
+      data.forward(message)
       stay()
     case Event(message@Item.GetOwnerRequest(), _) =>
-      owner.tell(message, sender())
+      owner.forward(message)
       stay()
     case Event(message@Item.SetOwnerRequest(_, _), _) =>
-      owner.tell(message, sender())
+      owner.forward(message)
       stay()
   }
 }
@@ -187,7 +193,12 @@ object ItemManager {
 
   case class GetResponse(id: UUID, item: Option[ActorRef])
 
+  case class GetDataRequest(ids: Set[UUID])
+
+  case class GetDataResponse(datas: Map[UUID, Option[Item.Data]])
+
   case class Snapshot()
+
 }
 
 class ItemManager(rooms: () => ActorRef, characters: () => ActorRef)
@@ -229,3 +240,14 @@ class ItemManager(rooms: () => ActorRef, characters: () => ActorRef)
     case CharacterManager.Snapshot() => saveSnapshot(state)
   }
 }
+
+object ItemManagerDataCollector {
+  def props(ids: Set[UUID]) = Props(new ItemManagerDataCollector(ids = ids))
+}
+
+class ItemManagerDataCollector(ids: Set[UUID]) extends Actor {
+  override def receive: Receive = {
+    case _ =>
+  }
+}
+

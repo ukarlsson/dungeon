@@ -26,6 +26,8 @@ object CharacterParsers extends CharacterParsers {
 
   case class Create() extends Command
 
+  case class Inventory() extends Command
+
 }
 
 trait CharacterParsers extends RegexParsers {
@@ -35,7 +37,7 @@ trait CharacterParsers extends RegexParsers {
   def direction: Parser[Direction.Value] = Direction.values.toList.map(v => v.toString ^^^ v)
     .reduceLeft(_ | _)
 
-  def wildcard: Parser[String] = """(.+)""".r ^^ {
+  def wildcard: Parser[String] = "(.+)".r ^^ {
     _.toString
   }
 
@@ -52,13 +54,11 @@ trait CharacterParsers extends RegexParsers {
     case _ ~ message => Say(message)
   }
 
-  def sleep: Parser[Sleep] = "sleep" ^^^ {
-    Sleep()
-  }
+  def sleep: Parser[Sleep] = "sleep" ^^^ { Sleep() }
 
-  def create: Parser[Create] = "create" ^^^ {
-    Create()
-  }
+  def create: Parser[Create] = "create" ^^^ { Create() }
+
+  def inventory: Parser[Inventory] = "^(i|inventory)$".r ^^^ { Inventory() }
 
   def command: Parser[Command] = look | walk | say | sleep | create
 }
@@ -89,11 +89,12 @@ object CharacterState extends Enumeration {
   val WalkPending = Value
   val SleepPending = Value
   val CreatePending = Value
+  val InventoryPending = Value
 }
 
 object Character {
 
-  def props(id: UUID, rooms: ActorRef, items: ActorRef) =
+  def props(id: UUID, rooms: ActorRef, items: ActorRef)(implicit config: DungeonConfig) =
     Props(new Character(id = id, rooms = rooms, items = items))
 
   case class Connect(connection: ActorRef)
@@ -145,13 +146,14 @@ class CharacterLookCollector(character: ActorRef, input: Room.Description)
   }
 }
 
-class Character(id: UUID, rooms: ActorRef, items: ActorRef)
+class Character(id: UUID, rooms: ActorRef, items: ActorRef)(implicit config: DungeonConfig)
   extends LoggingFSM[CharacterState.Value, CharacterStateData.Data] with ActorLogging {
 
   import se.netcat.dungeon.CharacterState._
   import se.netcat.dungeon.CharacterStateData._
 
   val characterData: ActorRef = context.actorOf(CharacterData.props(id))
+  val characterItems: ActorRef = context.actorOf(CharacterItems.props(id))
 
   var connections: Set[ActorRef] = Set()
 
@@ -191,7 +193,7 @@ class Character(id: UUID, rooms: ActorRef, items: ActorRef)
     case Some(room) =>
       room.ask(Room.GetDescription())(5 second).map({
         case Room.GetDescriptionResult(description) =>
-          context.actorOf(Props(classOf[CharacterLookCollector], self, description))
+          context.actorOf(Props(classOf[CharacterLookCollector], self, description), "look-collector")
       })
       true
     case None =>
@@ -233,8 +235,12 @@ class Character(id: UUID, rooms: ActorRef, items: ActorRef)
             stay()
           case CharacterParsers.Create() =>
             write("You start creating something.")
-            context.actorOf(CharacterItemCreator.props(id, items))
+            context.actorOf(CharacterItemCreator.props(id, items), "item-creator")
             goto(CreatePending)
+          case CharacterParsers.Inventory() =>
+            write("You start checking your inventory.")
+            context.actorOf(CharacterItemCreator.props(id, items), "item-inventory")
+            goto(InventoryPending)
         }
       } else {
         write("What?")
@@ -278,6 +284,7 @@ class Character(id: UUID, rooms: ActorRef, items: ActorRef)
     case Event(CharacterItemCreator.CreateItemResponse(result), DataNone) =>
       result match {
         case Some(itemId) =>
+          characterItems ! CharacterItems.SetRequest(itemId)
           write("You created an item.")
         case None =>
           write("You failed to create an item.")
@@ -376,8 +383,8 @@ object CharacterItemCreatorState extends Enumeration {
   type CharacterItemCreaterState = Value
 
   val PreStart = Value
-  val CreateItemPending = Value
-  val SetItemPending = Value
+  val ItemCreatePending = Value
+  val ItemSetupPending = Value
 }
 
 object CharacterItemCreator {
@@ -391,12 +398,9 @@ object CharacterItemCreator {
 
   case class DataNone() extends Data
 
-  case class DataItem(item: ActorRef) extends Data
-
-  case class DataItemSetResult(owner: Boolean, basic: Boolean) extends Data
+  case class DataResponseResult(map: Map[Any, Boolean]) extends Data
 
 }
-
 
 class CharacterItemCreator(id: UUID, items: ActorRef)
   extends LoggingFSM[CharacterItemCreatorState.Value, CharacterItemCreator.Data] {
@@ -415,26 +419,41 @@ class CharacterItemCreator(id: UUID, items: ActorRef)
   when(PreStart) {
     case Event(Start(), DataNone()) =>
       items ! ItemManager.CreateRequest(itemId, ItemClass.Basic)
-      goto(CreateItemPending).using(DataNone())
+      goto(ItemCreatePending).using(DataNone())
   }
 
-  when(CreateItemPending) {
+  when(ItemCreatePending) {
     case Event(ItemManager.CreateResponse(Some(item)), DataNone()) =>
-      item ! Item.SetBasicRequest(Set("basic"), "a basic item")
+      item ! Item.SetDataRequest(Set("basic"), Some("a basic item"))
       item ! Item.SetOwnerRequest(0, Some(id))
-      goto(SetItemPending).using(DataItemSetResult(owner = false, basic = false))
+
+      goto(ItemSetupPending).using(DataResponseResult(Map(
+        Item.SetOwnerResponse(success = true) -> false,
+        Item.SetDataResponse() -> false
+      )))
   }
 
-  when(SetItemPending) {
-    case Event(Item.SetBasicResponse(), DataItemSetResult(true, true)) =>
-      context.parent ! CreateItemResponse(Some(itemId))
-      stop()
-    case Event(Item.SetBasicResponse(), DataItemSetResult(_, _)) =>
-      stay()
+  when(ItemSetupPending) {
+    case Event(message, result@DataResponseResult(_)) =>
+
+      var map = result.map
+
+      if (map.get(message) == Some(false)) {
+        map += (message -> true)
+      }
+
+      if (map.values.forall(identity)) {
+        context.parent ! CreateItemResponse(Some(itemId))
+        stop()
+      } else {
+        stay().using(DataResponseResult(map))
+      }
   }
 }
 
 object CharacterItems {
+
+  def props(id: UUID)(implicit config: DungeonConfig) = Props(new CharacterItems(id = id))
 
   case class SetRequest(id: UUID)
 
@@ -452,7 +471,7 @@ object CharacterItems {
 
 }
 
-class CharacterItems(id: UUID) extends PersistentActor {
+class CharacterItems(id: UUID)(implicit config: DungeonConfig) extends PersistentActor {
 
   import se.netcat.dungeon.CharacterItems._
 

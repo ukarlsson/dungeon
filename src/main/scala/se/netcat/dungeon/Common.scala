@@ -1,8 +1,8 @@
 package se.netcat.dungeon
 
 import java.util.UUID
-
 import akka.actor.{ActorPath, ActorSystem}
+import reactivemongo.api.MongoDriver
 
 object Implicits {
   implicit def convertUUIDToString(uuid: UUID): String = uuid.toString
@@ -11,10 +11,9 @@ object Implicits {
   }
 }
 
-class DungeonConfig(val system: ActorSystem, val modules: Map[Module.Value, String]) {
-
-}
+class DungeonConfig(val system: ActorSystem, val modules: Map[Module.Value, String], val mongo: MongoDriver)
 
 object DungeonConfig {
-  def apply(system: ActorSystem, modules: Map[Module.Value, String]) = new DungeonConfig(system, modules)
+  def apply(system: ActorSystem, modules: Map[Module.Value, String], mongo: MongoDriver) =
+    new DungeonConfig(system, modules, mongo)
 }

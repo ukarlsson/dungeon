@@ -1,15 +1,12 @@
 package se.netcat.dungeon
 
-import java.io.{ObjectOutputStream, ByteArrayOutputStream}
 import java.net.InetSocketAddress
 import java.util.UUID
+import reactivemongo.api.MongoDriver
 
 import akka.actor._
-import akka.event.LoggingReceive
 import akka.io.{IO, Tcp}
-
-import Implicits.convertUUIDToString
-import Implicits.convertPairToPath
+import se.netcat.dungeon.Implicits.convertPairToPath
 
 object SpecialRoom extends Enumeration {
   type SpecialRoom = Value
@@ -28,17 +25,19 @@ object Module extends Enumeration {
 object Main extends App {
   implicit val system = ActorSystem("netcat")
 
+  val mongo = new MongoDriver(system)
+  
   implicit val config = DungeonConfig(
     modules = Map(
       Module.Character -> "characters",
       Module.Item -> "items",
       Module.Room -> "rooms"
     ),
-    system = system
+    system = system,
+    mongo = mongo
   )
 
-  system.actorSelection(Module.Character, UUID.randomUUID())
-  /*
+  system.actorSelection((Module.Character, UUID.randomUUID()))
 
   lazy val rooms: ActorRef = system.actorOf(RoomManager.props(), config.modules(Module.Room))
 
@@ -51,25 +50,6 @@ object Main extends App {
   val server: ActorRef = system.actorOf(Server.props(characters = () => characters, resolver = resolver), "server")
 
   (rooms, characters, items)
-  */
-
-  trait Trait {
-    case class InTrait()
-  }
-  object Object extends Trait {
-    case class InObject(v: Int)
-  }
-
-
-  val o1 = Object.InTrait()
-  val o2 = Object.InObject(1)
-
-  o2.getClass
-
-  val bos = new ByteArrayOutputStream
-  val out = new ObjectOutputStream(bos)
-  out.writeObject(o1)
-  out.writeObject(o2)
 }
 
 object Server {
