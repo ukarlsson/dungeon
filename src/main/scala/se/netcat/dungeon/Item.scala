@@ -2,72 +2,29 @@ package se.netcat.dungeon
 
 import akka.actor._
 import akka.event.LoggingReceive
-import akka.persistence.{PersistentActor, SnapshotOffer}
+import akka.persistence.{ PersistentActor, SnapshotOffer }
 import reactivemongo.bson.BSONObjectID
+import reactivemongo.bson.BSONDocumentReader
+import reactivemongo.bson.BSONDocument
+import com.escalatesoft.subcut.inject.BindingModule
+import com.escalatesoft.subcut.inject.Injectable
+import reactivemongo.api.collections.default.BSONCollection
+import reactivemongo.api.DefaultDB
+import scala.concurrent.ExecutionContext.Implicits.global
+import scala.concurrent.Future
 
-trait ItemDataCommon {
-
-}
-
-object ItemData extends ItemDataCommon {
-
-  def props(id: BSONObjectID) = Props(new ItemData(id = id))
-
-  case class Snapshot()
-
-}
-
-class ItemData(id: BSONObjectID) extends PersistentActor {
-
-  import se.netcat.dungeon.ItemData._
-  import se.netcat.dungeon.Item._
-
-  override def persistenceId: String = "item-data-%s".format(id)
-
-  var handles: Set[String] = Set()
-  var brief: Option[String] = None
-
-  case class SnapshotStateV1(handles: Set[String], brief: Option[String])
-
-  val receiveRecover: Receive = LoggingReceive {
-    case message@SetDataRequest(_, _) =>
-      handles = message.handles
-      brief = message.brief
-    case SnapshotOffer(_, snapshot: SnapshotStateV1) =>
-      handles = snapshot.handles
-      brief = snapshot.brief
-  }
-
-  val receiveCommand: Receive = LoggingReceive {
-    case message@SetDataRequest(_, _) =>
-      persist(message) {
-        message =>
-          handles = message.handles
-          brief = message.brief
-          sender() ! SetDataResponse()
-      }
-    case GetDataRequest() => sender() ! GetDataResponse(handles, brief)
-    case Snapshot() => saveSnapshot(SnapshotStateV1(handles, brief))
-  }
-}
-
-trait ItemOwnerCommon {
-
-}
-
-object ItemOwner extends ItemOwnerCommon {
+object ItemOwner {
 
   def props(id: BSONObjectID, characters: ActorRef) = Props(
     new ItemOwner(id = id, characters = characters))
 
   case class Snapshot()
-
 }
 
 class ItemOwner(id: BSONObjectID, characters: ActorRef) extends PersistentActor {
 
-  import se.netcat.dungeon.ItemOwner._
-  import se.netcat.dungeon.Item._
+  import ItemOwner._
+  import Item._
 
   override def persistenceId: String = "item-owner-%s".format(id)
 
@@ -77,7 +34,7 @@ class ItemOwner(id: BSONObjectID, characters: ActorRef) extends PersistentActor 
   case class SnapshotStateV1(sequence: Long, owner: Option[BSONObjectID])
 
   val receiveRecover: Receive = LoggingReceive {
-    case message@SetOwnerRequest(_, _) =>
+    case message @ SetOwnerRequest(_, _) =>
       sequence += 1
       owner = message.owner
     case SnapshotOffer(_, snapshot: SnapshotStateV1) =>
@@ -86,7 +43,7 @@ class ItemOwner(id: BSONObjectID, characters: ActorRef) extends PersistentActor 
   }
 
   val receiveCommand: Receive = LoggingReceive {
-    case message@SetOwnerRequest(_, _) =>
+    case message @ SetOwnerRequest(_, _) =>
       if (message.sequence == sequence) {
         persist(message) {
           message =>
@@ -104,38 +61,26 @@ class ItemOwner(id: BSONObjectID, characters: ActorRef) extends PersistentActor 
 
 object ItemBasicState extends Enumeration {
 
-  type ItemBasicState = Value
-
   val Start = Value
 }
 
-object Item extends ItemDataCommon with ItemOwnerCommon {
+object ItemClass extends Enumeration {
+
+  val Basic = Value(0)
+}
+
+object Item extends {
 
   val ItemClassMap: Map[ItemClass.Value, Class[_ <: Item]] = Map(
-    ItemClass.Basic -> classOf[ItemBasic]
-  )
+    ItemClass.Basic -> classOf[ItemBasic])
 
   def props(clazz: ItemClass.Value, id: BSONObjectID, characters: ActorRef) =
     Props(ItemClassMap(clazz), id, characters)
 
   case class SetOwnerRequest(sequence: Long, owner: Option[BSONObjectID])
-
   case class SetOwnerResponse(success: Boolean)
-
   case class GetOwnerRequest()
-
   case class GetOwnerResponse(sequence: Long, owner: Option[BSONObjectID])
-
-  case class SetDataRequest(handles: Set[String], brief: Option[String])
-
-  case class SetDataResponse()
-
-  case class GetDataRequest()
-
-  case class GetDataResponse(handles: Set[String], brief: Option[String])
-
-  case class Data(handles: Set[String], brief: Option[String])
-
 }
 
 abstract class Item
@@ -143,10 +88,9 @@ abstract class Item
 class ItemBasic(id: BSONObjectID, characters: ActorRef)
   extends Item with LoggingFSM[ItemBasicState.Value, Option[Nothing]] {
 
-  import se.netcat.dungeon.ItemBasicState._
+  import ItemBasicState._
 
   val owner = context.actorOf(ItemOwner.props(id, characters), "owner")
-  val data = context.actorOf(ItemData.props(id), "data")
 
   startWith(Start, None)
 
@@ -156,86 +100,37 @@ class ItemBasic(id: BSONObjectID, characters: ActorRef)
   }
 
   whenUnhandled {
-    case Event(message@Item.SetDataRequest(_, _), _) =>
-      data.forward(message)
-      stay()
-    case Event(message@Item.GetDataRequest(), _) =>
-      data.forward(message)
-      stay()
-    case Event(message@Item.GetOwnerRequest(), _) =>
+    case Event(message @ Item.GetOwnerRequest(), _) =>
       owner.forward(message)
       stay()
-    case Event(message@Item.SetOwnerRequest(_, _), _) =>
+    case Event(message @ Item.SetOwnerRequest(_, _), _) =>
       owner.forward(message)
       stay()
   }
-}
-
-object ItemClass extends Enumeration {
-
-  type ItemClass = Value
-
-  val Basic = Value(0)
 }
 
 object ItemManager {
 
-  def props(rooms: () => ActorRef, characters: () => ActorRef) =
+  def props(rooms: () => ActorRef, characters: () => ActorRef)(implicit bindingModule: BindingModule) =
     Props(new ItemManager(rooms = rooms, characters = characters))
 
-  case class CreateRequest(id: BSONObjectID, clazz: ItemClass.Value)
-
-  case class CreateResponse(item: Option[ActorRef])
-
-  case class GetRequest(id: BSONObjectID)
-
-  case class GetResponse(id: BSONObjectID, item: Option[ActorRef])
-
-  case class GetDataRequest(ids: Set[BSONObjectID])
-
-  case class GetDataResponse(datas: Map[BSONObjectID, Option[Item.Data]])
-
-  case class Snapshot()
-
+  case class UpdateRequest(id: BSONObjectID, clazz: ItemClass.Value)
+  case class UpdateResponse(id: BSONObjectID, item: ActorRef)
 }
 
-class ItemManager(rooms: () => ActorRef, characters: () => ActorRef)
-  extends PersistentActor with ActorLogging {
+class ItemManager(rooms: () => ActorRef, characters: () => ActorRef)(implicit bindingModule: BindingModule)
 
-  import se.netcat.dungeon.ItemManager._
+  extends Actor with ActorLogging {
 
-  override def persistenceId = "item"
+  import ItemManager._
 
-  var state = Map[BSONObjectID, ItemClass.Value]()
-  var items = Map[BSONObjectID, ActorRef]()
-
-  val receiveRecover: Receive = LoggingReceive {
-    case CreateRequest(id, clazz) =>
-      if (!state.contains(id)) {
-        state += ((id, clazz))
-        items += ((id, context.actorOf(Item.props(clazz, id, characters()), id.stringify)))
+  val receive: Receive = LoggingReceive {
+    case UpdateRequest(id, clazz) =>
+      val item = context.child(id.stringify) match {
+        case Some(item) => item
+        case None => context.actorOf(Item.props(clazz, id, characters()), id.stringify)
       }
-    case SnapshotOffer(_, snapshot: Map[BSONObjectID, ItemClass.Value]) =>
-      for ((id, clazz) <- snapshot) {
-        state += ((id, clazz))
-        items += ((id, context.actorOf(Item.props(clazz, id, characters()), id.stringify)))
-      }
-  }
-
-  val receiveCommand: Receive = LoggingReceive {
-    case message@CreateRequest(_, _) =>
-      persist(message) {
-        case CreateRequest(id, clazz) =>
-          if (!state.contains(id)) {
-            state += ((id, clazz))
-            items += ((id, context.actorOf(Item.props(clazz, id, characters()), id.stringify)))
-          }
-          sender() ! CreateResponse(items.get(id))
-      }
-
-    case GetRequest(id) => sender() ! GetResponse(id, items.get(id))
-
-    case ItemManager.Snapshot() => saveSnapshot(state)
+      sender() ! UpdateResponse(id, item)
   }
 }
 
@@ -249,3 +144,32 @@ class ItemManagerDataCollector(ids: Set[BSONObjectID]) extends Actor {
   }
 }
 
+case class ItemData(id: BSONObjectID, handles: Set[String], brief: String)
+
+object ItemData {
+
+  implicit object PersonReader extends BSONDocumentReader[ItemData] {
+    def read(document: BSONDocument): ItemData = {
+      val id = document.getAs[BSONObjectID]("_id").get
+      val handles = document.getAs[Set[String]]("handles").get
+      val brief = document.getAs[String]("brief").get
+
+      ItemData(id, handles, brief)
+    }
+  }
+}
+
+class ItemStore()(implicit val bindingModule: BindingModule) extends Injectable {
+
+  import MongoBindingKey._
+
+  val collection = inject[DefaultDB].collection[BSONCollection]("item")
+
+  def insert(id: BSONObjectID, handles: Set[String], brief: String): Future[Unit] = {
+    collection.insert(BSONDocument("_id_" -> id, "handles" -> handles, "brief" -> brief)).map(_ => ())
+  }
+
+  def find(id: BSONObjectID): Future[Option[ItemData]] = {
+    collection.find(BSONDocument("_id" -> id)).one[ItemData]
+  }
+}

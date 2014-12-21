@@ -59,7 +59,7 @@ object PlayerState extends Enumeration {
 
   type PlayerConnectionState = Value
 
-  val Start = Value
+  val PreStart = Value
   val CharacterCheckExisting = Value
   val CharacterLogin = Value
   val CharacterCreate = Value
@@ -80,11 +80,13 @@ abstract class Player(connection: ActorRef, characters: ActorRef)(implicit bindi
   extends LoggingFSM[PlayerState.Value, Option[PlayerData.Data]] with Injectable
   with ActorLogging {
 
-  import se.netcat.dungeon.PlayerData._
-  import se.netcat.dungeon.PlayerState._
+  import PlayerData._
+  import PlayerState._
+
+  case class Start()
 
   case class CharacterInsertResult(result: Boolean)
-  case class CharacterFindResult(result: Option[CharacterMongo])
+  case class CharacterFindResult(result: Option[CharacterData])
 
   implicit val managers = inject[Map[Manager.Value, String]]
 
@@ -92,9 +94,9 @@ abstract class Player(connection: ActorRef, characters: ActorRef)(implicit bindi
 
   def send(data: String): Unit
 
-  startWith(Start, None)
+  startWith(PreStart, None)
 
-  override def preStart() = self ! StateTimeout
+  self ! Start()
 
   onTransition {
     case _ -> CharacterCheckExisting =>
@@ -123,8 +125,8 @@ abstract class Player(connection: ActorRef, characters: ActorRef)(implicit bindi
       send("Please visit the Dungeon soon again.")
   }
 
-  when(Start, stateTimeout = 0 second) {
-    case Event(StateTimeout, None) =>
+  when(PreStart) {
+    case Event(Start(), None) =>
       goto(CharacterCheckExisting)
   }
 
@@ -152,16 +154,16 @@ abstract class Player(connection: ActorRef, characters: ActorRef)(implicit bindi
           stay().using(None)
         case PlayerParsers.Failure(_, _) =>
           send("Parse error.")
-          goto(Start).using(None)
+          goto(PreStart).using(None)
       }
 
     case Event(CharacterFindResult(result), None) =>
       result match {
-        case Some(CharacterMongo(id, name)) =>
+        case Some(CharacterData(id, name)) =>
           goto(CharacterUpdate).using(Some(DataCharacterInfo(id, name)))
         case None =>
           send("Unable lo locate character.")
-          goto(Start).using(None)
+          goto(PreStart).using(None)
       }
   }
 
@@ -177,7 +179,7 @@ abstract class Player(connection: ActorRef, characters: ActorRef)(implicit bindi
           stay().using(Some(DataCharacterInfo(id, name)))
         case PlayerParsers.Failure(_, _) =>
           send("That is not a valid name!")
-          goto(Start).using(None)
+          goto(PreStart).using(None)
       }
 
     case Event(CharacterInsertResult(result), Some(DataCharacterInfo(id, name))) =>
@@ -186,7 +188,7 @@ abstract class Player(connection: ActorRef, characters: ActorRef)(implicit bindi
           goto(CharacterUpdate)
         case false =>
           send("That character did not want to play!")
-          goto(Start).using(None)
+          goto(PreStart).using(None)
       }
 
   }
@@ -202,7 +204,7 @@ abstract class Player(connection: ActorRef, characters: ActorRef)(implicit bindi
         case PlayerParsers.Success(command, _) =>
           command match {
             case PlayerParsers.Exit() =>
-              goto(Start).using(None)
+              goto(PreStart).using(None)
           }
         case PlayerParsers.Failure(_, _) =>
           character ! Player.IncomingMessage(data)

@@ -28,8 +28,6 @@ object Manager extends Enumeration {
 object MongoBindingKey {
   object NodeList extends BindingId
   object Database extends BindingId
-  object CollectionCharacter extends BindingId
-  object CollectionItem extends BindingId
 }
 
 object MongoModule extends NewBindingModule(module => {
@@ -42,7 +40,7 @@ object MongoModule extends NewBindingModule(module => {
   }
 
   bind[MongoDriver].toModuleSingle {
-    implicit module => new MongoDriver(module.inject[ActorSystem](None))
+    implicit module => new MongoDriver()
   }
 
   bind[List[String]].identifiedBy(NodeList).toSingle {
@@ -67,11 +65,6 @@ object MongoModule extends NewBindingModule(module => {
       connection(name)
   }
 
-  bind[BSONCollection].identifiedBy(CollectionCharacter).toModuleSingle {
-    implicit module =>
-      val database = module.inject[DefaultDB](None)
-      database[BSONCollection]("character")
-  }
   
   bind[Map[Manager.Value, String]].toSingle {
     Map(
@@ -79,8 +72,6 @@ object MongoModule extends NewBindingModule(module => {
       Manager.Item -> "items",
       Manager.Room -> "rooms");
   }
-
-  
 })
 
 object Main extends App {
