@@ -229,7 +229,7 @@ object TcpPlayer {
     new TcpPlayer(connection = connection, characters = characters))
 }
 
-class TcpPlayer(connection: ActorRef, characters: ActorRef)(implicit bindingModule: BindingModule)
+class TcpPlayer(connection: ActorRef, characters: ActorRef)(implicit val bindingModule: BindingModule)
   extends Player(connection = connection, characters = characters) with ActorLogging {
 
   def decode(data: ByteString) = data.decodeString("UTF-8")

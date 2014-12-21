@@ -547,7 +547,9 @@ object CharacterMongo {
 }
 
 class CharacterStore()(implicit val bindingModule: BindingModule) extends Injectable {
-  val collection = inject[BSONCollection](DungeonBindingKey.Mongo.Collection.Character)
+  import MongoBindingKey._
+
+  val collection = inject[BSONCollection](CollectionCharacter)
 
   def insert(id: BSONObjectID, name: String): Future[Unit] = {
     collection.insert(BSONDocument("_id_" -> id, "name" -> name)).map(_ => ())

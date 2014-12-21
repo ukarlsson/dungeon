@@ -25,22 +25,17 @@ object Manager extends Enumeration {
   var Room = Value
 }
 
-object DungeonBindingKey {
-  object Mongo {
-    object NodeList extends BindingId
-    object Database extends BindingId
-
-    object Collection {
-      object Character extends BindingId
-      object Item extends BindingId
-    }
-  }
+object MongoBindingKey {
+  object NodeList extends BindingId
+  object Database extends BindingId
+  object CollectionCharacter extends BindingId
+  object CollectionItem extends BindingId
 }
 
-object DungeonModule extends NewBindingModule(module => {
+object MongoModule extends NewBindingModule(module => {
   import module._
   
-  import DungeonBindingKey._
+  import MongoBindingKey._
 
   bind[ActorSystem].toSingle {
     ActorSystem("dungeon")
@@ -50,25 +45,29 @@ object DungeonModule extends NewBindingModule(module => {
     implicit module => new MongoDriver(module.inject[ActorSystem](None))
   }
 
-  bind[List[String]].identifiedBy(Mongo.NodeList).toSingle {
+  bind[List[String]].identifiedBy(NodeList).toSingle {
     List("localhost")
   }
 
   bind[MongoConnection].toModuleSingle {
     implicit module =>
       val driver = module.inject[MongoDriver](None)
-      val nodes = module.inject[List[String]](Some(Mongo.NodeList))
+      val nodes = module.inject[List[String]](Some(NodeList))
       driver.connection(nodes)
+  }
+  
+  bind[String].identifiedBy(Database).toSingle {
+    "dungeon"
   }
   
   bind[DefaultDB].toModuleSingle {
     implicit module =>
       val connection = module.inject[MongoConnection](None)
-      val name = module.inject[String](Some(Mongo.Database))
+      val name = module.inject[String](Some(Database))
       connection(name)
   }
 
-  bind[BSONCollection].identifiedBy(Mongo.Collection.Character).toModuleSingle {
+  bind[BSONCollection].identifiedBy(CollectionCharacter).toModuleSingle {
     implicit module =>
       val database = module.inject[DefaultDB](None)
       database[BSONCollection]("character")
@@ -86,7 +85,7 @@ object DungeonModule extends NewBindingModule(module => {
 
 object Main extends App {
   
-  implicit val bindingModule = DungeonModule
+  implicit val bindingModule = MongoModule
   
   val system = bindingModule.inject[ActorSystem](None)
   val modules = bindingModule.inject[Map[Manager.Value, String]](None)
