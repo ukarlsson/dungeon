@@ -3,17 +3,22 @@ package se.netcat.dungeon
 import java.util.UUID
 import akka.actor.{ActorPath, ActorSystem}
 import reactivemongo.api.MongoDriver
+import reactivemongo.api.DefaultDB
+import reactivemongo.bson.BSONBinary
+import reactivemongo.bson.BSONValue
+import reactivemongo.bson.Subtype
+import reactivemongo.bson.BSONObjectID
+import akka.actor.ActorContext
 
 object Implicits {
-  implicit def convertUUIDToString(uuid: UUID): String = uuid.toString
-  implicit def convertPairToPath(pair: (Module.Value, UUID))(implicit config: DungeonConfig): ActorPath = pair match {
-    case (value, uuid) => config.system.child(config.modules(value)).child(uuid)
+  implicit def convertPairToPath(pair: (Manager.Value, BSONObjectID))(implicit managers: Map[Manager.Value, String], context: ActorContext): ActorPath = pair match {
+    case (value, id) => context.system.child(managers(value)).child(id.stringify)
   }
 }
 
-class DungeonConfig(val system: ActorSystem, val modules: Map[Module.Value, String], val mongo: MongoDriver)
+class DungeonConfig(val system: ActorSystem, val modules: Map[Manager.Value, String] )
 
 object DungeonConfig {
-  def apply(system: ActorSystem, modules: Map[Module.Value, String], mongo: MongoDriver) =
-    new DungeonConfig(system, modules, mongo)
+  def apply(system: ActorSystem, modules: Map[Manager.Value, String] ) =
+    new DungeonConfig(system, modules)
 }

@@ -35,6 +35,7 @@ libraryDependencies ++= {
     "org.specs2"              %%  "specs2"                 % "2.3.13"        % "test",
     "org.scala-lang.modules" %% "scala-parser-combinators" % "1.0.2",
      "io.spray"               %% "spray-json"              % "1.3.1",
-    "org.reactivemongo"       %% "reactivemongo"           % "0.10.5.0.akka23"
+    "org.reactivemongo"       %% "reactivemongo"           % "0.10.5.0.akka23",
+    "com.escalatesoft.subcut" %% "subcut"                  % "2.1"
   )
 }

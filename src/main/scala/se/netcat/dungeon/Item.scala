@@ -1,11 +1,9 @@
 package se.netcat.dungeon
 
-import java.util.UUID
-
 import akka.actor._
 import akka.event.LoggingReceive
 import akka.persistence.{PersistentActor, SnapshotOffer}
-import se.netcat.dungeon.Implicits.convertUUIDToString
+import reactivemongo.bson.BSONObjectID
 
 trait ItemDataCommon {
 
@@ -13,13 +11,13 @@ trait ItemDataCommon {
 
 object ItemData extends ItemDataCommon {
 
-  def props(id: UUID) = Props(new ItemData(id = id))
+  def props(id: BSONObjectID) = Props(new ItemData(id = id))
 
   case class Snapshot()
 
 }
 
-class ItemData(id: UUID) extends PersistentActor {
+class ItemData(id: BSONObjectID) extends PersistentActor {
 
   import se.netcat.dungeon.ItemData._
   import se.netcat.dungeon.Item._
@@ -59,14 +57,14 @@ trait ItemOwnerCommon {
 
 object ItemOwner extends ItemOwnerCommon {
 
-  def props(id: UUID, characters: ActorRef) = Props(
+  def props(id: BSONObjectID, characters: ActorRef) = Props(
     new ItemOwner(id = id, characters = characters))
 
   case class Snapshot()
 
 }
 
-class ItemOwner(id: UUID, characters: ActorRef) extends PersistentActor {
+class ItemOwner(id: BSONObjectID, characters: ActorRef) extends PersistentActor {
 
   import se.netcat.dungeon.ItemOwner._
   import se.netcat.dungeon.Item._
@@ -74,9 +72,9 @@ class ItemOwner(id: UUID, characters: ActorRef) extends PersistentActor {
   override def persistenceId: String = "item-owner-%s".format(id)
 
   var sequence: Long = 0
-  var owner: Option[UUID] = None
+  var owner: Option[BSONObjectID] = None
 
-  case class SnapshotStateV1(sequence: Long, owner: Option[UUID])
+  case class SnapshotStateV1(sequence: Long, owner: Option[BSONObjectID])
 
   val receiveRecover: Receive = LoggingReceive {
     case message@SetOwnerRequest(_, _) =>
@@ -117,16 +115,16 @@ object Item extends ItemDataCommon with ItemOwnerCommon {
     ItemClass.Basic -> classOf[ItemBasic]
   )
 
-  def props(clazz: ItemClass.Value, id: UUID, characters: ActorRef) =
+  def props(clazz: ItemClass.Value, id: BSONObjectID, characters: ActorRef) =
     Props(ItemClassMap(clazz), id, characters)
 
-  case class SetOwnerRequest(sequence: Long, owner: Option[UUID])
+  case class SetOwnerRequest(sequence: Long, owner: Option[BSONObjectID])
 
   case class SetOwnerResponse(success: Boolean)
 
   case class GetOwnerRequest()
 
-  case class GetOwnerResponse(sequence: Long, owner: Option[UUID])
+  case class GetOwnerResponse(sequence: Long, owner: Option[BSONObjectID])
 
   case class SetDataRequest(handles: Set[String], brief: Option[String])
 
@@ -142,7 +140,7 @@ object Item extends ItemDataCommon with ItemOwnerCommon {
 
 abstract class Item
 
-class ItemBasic(id: UUID, characters: ActorRef)
+class ItemBasic(id: BSONObjectID, characters: ActorRef)
   extends Item with LoggingFSM[ItemBasicState.Value, Option[Nothing]] {
 
   import se.netcat.dungeon.ItemBasicState._
@@ -185,17 +183,17 @@ object ItemManager {
   def props(rooms: () => ActorRef, characters: () => ActorRef) =
     Props(new ItemManager(rooms = rooms, characters = characters))
 
-  case class CreateRequest(id: UUID, clazz: ItemClass.Value)
+  case class CreateRequest(id: BSONObjectID, clazz: ItemClass.Value)
 
   case class CreateResponse(item: Option[ActorRef])
 
-  case class GetRequest(id: UUID)
+  case class GetRequest(id: BSONObjectID)
 
-  case class GetResponse(id: UUID, item: Option[ActorRef])
+  case class GetResponse(id: BSONObjectID, item: Option[ActorRef])
 
-  case class GetDataRequest(ids: Set[UUID])
+  case class GetDataRequest(ids: Set[BSONObjectID])
 
-  case class GetDataResponse(datas: Map[UUID, Option[Item.Data]])
+  case class GetDataResponse(datas: Map[BSONObjectID, Option[Item.Data]])
 
   case class Snapshot()
 
@@ -208,19 +206,19 @@ class ItemManager(rooms: () => ActorRef, characters: () => ActorRef)
 
   override def persistenceId = "item"
 
-  var state = Map[UUID, ItemClass.Value]()
-  var items = Map[UUID, ActorRef]()
+  var state = Map[BSONObjectID, ItemClass.Value]()
+  var items = Map[BSONObjectID, ActorRef]()
 
   val receiveRecover: Receive = LoggingReceive {
     case CreateRequest(id, clazz) =>
       if (!state.contains(id)) {
         state += ((id, clazz))
-        items += ((id, context.actorOf(Item.props(clazz, id, characters()), id)))
+        items += ((id, context.actorOf(Item.props(clazz, id, characters()), id.stringify)))
       }
-    case SnapshotOffer(_, snapshot: Map[UUID, ItemClass.Value]) =>
+    case SnapshotOffer(_, snapshot: Map[BSONObjectID, ItemClass.Value]) =>
       for ((id, clazz) <- snapshot) {
         state += ((id, clazz))
-        items += ((id, context.actorOf(Item.props(clazz, id, characters()), id)))
+        items += ((id, context.actorOf(Item.props(clazz, id, characters()), id.stringify)))
       }
   }
 
@@ -230,22 +228,22 @@ class ItemManager(rooms: () => ActorRef, characters: () => ActorRef)
         case CreateRequest(id, clazz) =>
           if (!state.contains(id)) {
             state += ((id, clazz))
-            items += ((id, context.actorOf(Item.props(clazz, id, characters()), id)))
+            items += ((id, context.actorOf(Item.props(clazz, id, characters()), id.stringify)))
           }
           sender() ! CreateResponse(items.get(id))
       }
 
     case GetRequest(id) => sender() ! GetResponse(id, items.get(id))
 
-    case CharacterManager.Snapshot() => saveSnapshot(state)
+    case ItemManager.Snapshot() => saveSnapshot(state)
   }
 }
 
 object ItemManagerDataCollector {
-  def props(ids: Set[UUID]) = Props(new ItemManagerDataCollector(ids = ids))
+  def props(ids: Set[BSONObjectID]) = Props(new ItemManagerDataCollector(ids = ids))
 }
 
-class ItemManagerDataCollector(ids: Set[UUID]) extends Actor {
+class ItemManagerDataCollector(ids: Set[BSONObjectID]) extends Actor {
   override def receive: Receive = {
     case _ =>
   }

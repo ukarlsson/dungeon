@@ -1,13 +1,18 @@
 package se.netcat.dungeon
 
 import java.util.UUID
-
 import akka.actor._
 import akka.io.Tcp
 import akka.util.ByteString
-
 import scala.concurrent.duration._
 import scala.util.parsing.combinator.RegexParsers
+import com.escalatesoft.subcut.inject.BindingModule
+import reactivemongo.bson.BSONObjectID
+import scala.util.Success
+import scala.util.Failure
+import scala.concurrent.ExecutionContext.Implicits.global
+import com.escalatesoft.subcut.inject.Injectable
+import Implicits.convertPairToPath
 
 trait PlayerParsers extends RegexParsers {
 
@@ -58,30 +63,36 @@ object PlayerState extends Enumeration {
   val CharacterCheckExisting = Value
   val CharacterLogin = Value
   val CharacterCreate = Value
-  val Play = Value
+  val CharacterUpdate = Value
+  val CharacterPlay = Value
 }
 
 object PlayerData {
 
   sealed trait Data
 
-  final case class DataNone() extends Data
-  final case class DataLogin(name: Option[String], uuid: Option[UUID]) extends Data
-  final case class DataCreate(name: Option[String], uuid: Option[UUID], resolved: Boolean) extends Data
-  final case class DataPlaying(character: ActorRef) extends Data
+  final case class DataCharacterInfo(id: BSONObjectID, name: String) extends Data
+  final case class DataCharacter(character: ActorRef) extends Data
 
 }
 
-abstract class Player(connection: ActorRef, characters: ActorRef, resolver: ActorRef)
-  extends LoggingFSM[PlayerState.Value, PlayerData.Data]
+abstract class Player(connection: ActorRef, characters: ActorRef)(implicit bindingModule: BindingModule)
+  extends LoggingFSM[PlayerState.Value, Option[PlayerData.Data]] with Injectable
   with ActorLogging {
 
   import se.netcat.dungeon.PlayerData._
   import se.netcat.dungeon.PlayerState._
 
+  case class CharacterInsertResult(result: Boolean)
+  case class CharacterFindResult(result: Option[CharacterMongo])
+
+  implicit val managers = inject[Map[Manager.Value, String]]
+
+  val store = new CharacterStore()
+
   def send(data: String): Unit
 
-  startWith(Start, DataNone())
+  startWith(Start, None)
 
   override def preStart() = self ! StateTimeout
 
@@ -92,32 +103,38 @@ abstract class Player(connection: ActorRef, characters: ActorRef, resolver: Acto
       send("Please enter the name of your existing character:")
     case _ -> CharacterCreate =>
       send("Please enter the name of your new character:")
-    case _ -> Play =>
+    case _ -> CharacterUpdate =>
+      send("Updating character.")
+      nextStateData match {
+        case Some(DataCharacterInfo(id, name)) =>
+          characters ! CharacterManager.UpdateRequest(id)
+      }
+    case _ -> CharacterPlay =>
       send("Welcome to the Dungeon!")
       nextStateData match {
-        case DataPlaying(character) =>
+        case Some(DataCharacter(character)) =>
           character ! Character.Connect(self)
       }
-    case Play -> _ =>
+    case CharacterPlay -> _ =>
       stateData match {
-        case DataPlaying(character) =>
+        case Some(DataCharacter(character)) =>
           character ! Character.Disconnect(self)
       }
       send("Please visit the Dungeon soon again.")
   }
 
   when(Start, stateTimeout = 0 second) {
-    case Event(StateTimeout, DataNone()) =>
+    case Event(StateTimeout, None) =>
       goto(CharacterCheckExisting)
   }
 
   when(CharacterCheckExisting, stateTimeout = 60 second) {
-    case Event(Player.IncomingMessage(data), DataNone()) =>
+    case Event(Player.IncomingMessage(data), None) =>
       PlayerParsers.parse(PlayerParsers.boolean, data) match {
         case PlayerParsers.Success(true, _) =>
-          goto(CharacterLogin).using(DataLogin(None, None))
+          goto(CharacterLogin).using(None)
         case PlayerParsers.Success(false, _) =>
-          goto(CharacterCreate).using(DataCreate(None, None, resolved = false))
+          goto(CharacterCreate).using(None)
         case PlayerParsers.Failure(_, _) =>
           send("Use existing character? (yes/no)")
           stay()
@@ -125,76 +142,67 @@ abstract class Player(connection: ActorRef, characters: ActorRef, resolver: Acto
   }
 
   when(CharacterLogin, stateTimeout = 60 second) {
-    case Event(Player.IncomingMessage(data), DataLogin(None, None)) =>
+    case Event(Player.IncomingMessage(data), None) =>
       PlayerParsers.parse(PlayerParsers.name, data) match {
         case PlayerParsers.Success(name, _) =>
-          resolver ! CharacterResolver.GetRequest(name)
-          stay().using(DataLogin(Some(name), None))
+          store.find(name).andThen {
+            case Success(result) => self ! CharacterFindResult(result)
+            case Failure(_) => self ! CharacterFindResult(None)
+          }
+          stay().using(None)
         case PlayerParsers.Failure(_, _) =>
           send("Parse error.")
-          goto(Start).using(DataNone())
+          goto(Start).using(None)
       }
 
-    case Event(CharacterResolver.GetResponse(result), DataLogin(Some(name), None)) =>
+    case Event(CharacterFindResult(result), None) =>
       result match {
-        case Some(uuid) =>
-          characters ! CharacterManager.GetRequest(uuid)
-          stay().using(DataLogin(Some(name), Some(uuid)))
-        case None =>
-          send("Unable to resolve character.")
-          goto(Start).using(DataNone())
-      }
-
-    case Event(CharacterManager.GetResponse(result), DataLogin(Some(name), Some(uuid))) =>
-      result match {
-        case Some(character) =>
-          goto(Play).using(DataPlaying(character))
+        case Some(CharacterMongo(id, name)) =>
+          goto(CharacterUpdate).using(Some(DataCharacterInfo(id, name)))
         case None =>
           send("Unable lo locate character.")
-          goto(Start).using(DataNone())
+          goto(Start).using(None)
       }
   }
 
   when(CharacterCreate, stateTimeout = 60 second) {
-    case Event(Player.IncomingMessage(data), DataCreate(None, None, false)) =>
+    case Event(Player.IncomingMessage(data), None) =>
       PlayerParsers.parse(PlayerParsers.name, data) match {
         case PlayerParsers.Success(name, _) =>
-          val uuid = UUID.randomUUID()
-          resolver ! CharacterResolver.SetRequest(name, uuid)
-          stay().using(DataCreate(Some(name), Some(uuid), resolved = false))
+          val id = BSONObjectID.generate
+          store.insert(id, name).andThen {
+            case Success(()) => self ! CharacterInsertResult(true)
+            case Failure(_) => self ! CharacterInsertResult(false)
+          }
+          stay().using(Some(DataCharacterInfo(id, name)))
         case PlayerParsers.Failure(_, _) =>
           send("That is not a valid name!")
-          goto(Start).using(DataNone())
+          goto(Start).using(None)
       }
 
-    case Event(CharacterResolver.SetResponse(result), DataCreate(Some(name), Some(uuid), false)) =>
+    case Event(CharacterInsertResult(result), Some(DataCharacterInfo(id, name))) =>
       result match {
         case true =>
-          characters ! CharacterManager.CreateRequest(uuid)
-          stay().using(DataCreate(Some(name), Some(uuid), resolved = true))
+          goto(CharacterUpdate)
         case false =>
-          send("That name is already used!")
-          goto(Start).using(DataNone())
-      }
-
-    case Event(CharacterManager.CreateResponse(result), DataCreate(Some(name), Some(uuid), true)) =>
-      result match {
-        case Some(character) =>
-          goto(Play).using(DataPlaying(character))
-        case None =>
           send("That character did not want to play!")
-          goto(Start).using(DataNone())
+          goto(Start).using(None)
       }
 
   }
 
-  when(Play, stateTimeout = 3600 second) {
-    case Event(Player.IncomingMessage(data), DataPlaying(character)) =>
+  when(CharacterUpdate, stateTimeout = 60 second) {
+    case Event(CharacterManager.UpdateResponse(_, character), Some(DataCharacterInfo(id, name))) =>
+      goto(CharacterPlay).using(Some(DataCharacter(character)))
+  }
+
+  when(CharacterPlay, stateTimeout = 3600 second) {
+    case Event(Player.IncomingMessage(data), Some(DataCharacter(character))) =>
       PlayerParsers.parse(PlayerParsers.command, data) match {
         case PlayerParsers.Success(command, _) =>
           command match {
             case PlayerParsers.Exit() =>
-              goto(Start).using(DataNone())
+              goto(Start).using(None)
           }
         case PlayerParsers.Failure(_, _) =>
           character ! Player.IncomingMessage(data)
@@ -207,7 +215,7 @@ abstract class Player(connection: ActorRef, characters: ActorRef, resolver: Acto
   }
 
   whenUnhandled {
-    case Event(Player.Terminate, DataPlaying(character)) =>
+    case Event(Player.Terminate, Some(DataCharacter(character))) =>
       character ! Character.Disconnect(connection)
       stop()
     case Event(Player.Terminate, _) =>
@@ -217,12 +225,12 @@ abstract class Player(connection: ActorRef, characters: ActorRef, resolver: Acto
 
 object TcpPlayer {
 
-  def props(connection: ActorRef, characters: ActorRef, resolver: ActorRef) = Props(
-    new TcpPlayer(connection = connection, characters = characters, resolver = resolver))
+  def props(connection: ActorRef, characters: ActorRef)(implicit bindingModule: BindingModule) = Props(
+    new TcpPlayer(connection = connection, characters = characters))
 }
 
-class TcpPlayer(connection: ActorRef, characters: ActorRef, resolver: ActorRef)
-  extends Player(connection, characters, resolver) with ActorLogging {
+class TcpPlayer(connection: ActorRef, characters: ActorRef)(implicit bindingModule: BindingModule)
+  extends Player(connection = connection, characters = characters) with ActorLogging {
 
   def decode(data: ByteString) = data.decodeString("UTF-8")
 

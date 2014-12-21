@@ -1,16 +1,23 @@
 package se.netcat.dungeon
 
-import java.util.UUID
-
 import akka.actor._
 import akka.event.LoggingReceive
 import akka.pattern._
-import akka.persistence.{PersistentActor, SnapshotOffer}
-import se.netcat.dungeon.Implicits.{convertUUIDToString, convertPairToPath}
-
+import akka.persistence.{ PersistentActor, SnapshotOffer }
+import se.netcat.dungeon.Implicits.{ convertPairToPath }
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration._
 import scala.util.parsing.combinator.RegexParsers
+import com.escalatesoft.subcut.inject.BindingModule
+import com.escalatesoft.subcut.inject.Injectable
+import reactivemongo.api.DefaultDB
+import scala.util.Failure
+import scala.util.Success
+import scala.concurrent.Future
+import reactivemongo.core.commands.LastError
+import reactivemongo.api.Collection
+import reactivemongo.api.collections.default.BSONCollection
+import reactivemongo.bson._
 
 object CharacterParsers extends CharacterParsers {
 
@@ -94,7 +101,7 @@ object CharacterState extends Enumeration {
 
 object Character {
 
-  def props(id: UUID, rooms: ActorRef, items: ActorRef)(implicit config: DungeonConfig) =
+  def props(id: BSONObjectID, rooms: ActorRef, items: ActorRef)(implicit bindingModule: BindingModule) =
     Props(new Character(id = id, rooms = rooms, items = items))
 
   case class Connect(connection: ActorRef)
@@ -112,7 +119,7 @@ object Character {
 
   case class WalkResult(to: Option[ActorRef])
 
-  case class Message(category: CharacterMessageCategory.Value, sender: UUID,
+  case class Message(category: CharacterMessageCategory.Value, sender: BSONObjectID,
     description: Character.BasicDescription, message: String)
 
 }
@@ -130,7 +137,7 @@ class CharacterLookCollector(character: ActorRef, input: Room.Description)
   startWith(None, None)
 
   when(None, stateTimeout = 1 second) {
-    case Event(result@Character.GetDescriptionResult(data), _) =>
+    case Event(result @ Character.GetDescriptionResult(data), _) =>
       characters += sender() -> Option(result.description)
 
       if (!characters.values.exists(_.isEmpty)) {
@@ -146,7 +153,7 @@ class CharacterLookCollector(character: ActorRef, input: Room.Description)
   }
 }
 
-class Character(id: UUID, rooms: ActorRef, items: ActorRef)(implicit config: DungeonConfig)
+class Character(id: BSONObjectID, rooms: ActorRef, items: ActorRef)(implicit bindingModule: BindingModule)
   extends LoggingFSM[CharacterState.Value, CharacterStateData.Data] with ActorLogging {
 
   import se.netcat.dungeon.CharacterState._
@@ -324,7 +331,7 @@ class Character(id: UUID, rooms: ActorRef, items: ActorRef)(implicit config: Dun
 
 object CharacterData {
 
-  def props(id: UUID) = Props(new CharacterData(id = id))
+  def props(id: BSONObjectID) = Props(new CharacterData(id = id))
 
   case class SetNameRequest(name: String)
 
@@ -342,7 +349,7 @@ object CharacterData {
 
 }
 
-class CharacterData(id: UUID) extends PersistentActor {
+class CharacterData(id: BSONObjectID) extends PersistentActor {
 
   import se.netcat.dungeon.CharacterData._
 
@@ -361,13 +368,13 @@ class CharacterData(id: UUID) extends PersistentActor {
   }
 
   val receiveCommand: Receive = {
-    case message@SetNameRequest(_) =>
+    case message @ SetNameRequest(_) =>
       persist(message) {
         message =>
           name = Option(message.name)
           sender() ! SetNameResponse()
       }
-    case message@SetBriefRequest(_) =>
+    case message @ SetBriefRequest(_) =>
       persist(message) {
         message =>
           name = Option(message.brief)
@@ -389,10 +396,10 @@ object CharacterItemCreatorState extends Enumeration {
 
 object CharacterItemCreator {
 
-  def props(characterId: UUID, items: ActorRef) =
+  def props(characterId: BSONObjectID, items: ActorRef) =
     Props(new CharacterItemCreator(id = characterId, items = items))
 
-  case class CreateItemResponse(id: Option[UUID])
+  case class CreateItemResponse(id: Option[BSONObjectID])
 
   sealed trait Data
 
@@ -402,7 +409,7 @@ object CharacterItemCreator {
 
 }
 
-class CharacterItemCreator(id: UUID, items: ActorRef)
+class CharacterItemCreator(id: BSONObjectID, items: ActorRef)
   extends LoggingFSM[CharacterItemCreatorState.Value, CharacterItemCreator.Data] {
 
   import se.netcat.dungeon.CharacterItemCreator._
@@ -410,7 +417,7 @@ class CharacterItemCreator(id: UUID, items: ActorRef)
 
   case class Start()
 
-  val itemId = UUID.randomUUID()
+  val itemId = BSONObjectID.generate
 
   startWith(PreStart, DataNone())
 
@@ -429,12 +436,11 @@ class CharacterItemCreator(id: UUID, items: ActorRef)
 
       goto(ItemSetupPending).using(DataResponseResult(Map(
         Item.SetOwnerResponse(success = true) -> false,
-        Item.SetDataResponse() -> false
-      )))
+        Item.SetDataResponse() -> false)))
   }
 
   when(ItemSetupPending) {
-    case Event(message, result@DataResponseResult(_)) =>
+    case Event(message, result @ DataResponseResult(_)) =>
 
       var map = result.map
 
@@ -453,43 +459,43 @@ class CharacterItemCreator(id: UUID, items: ActorRef)
 
 object CharacterItems {
 
-  def props(id: UUID)(implicit config: DungeonConfig) = Props(new CharacterItems(id = id))
+  def props(id: BSONObjectID)(implicit bindingModule: BindingModule) = Props(new CharacterItems(id = id))
 
-  case class SetRequest(id: UUID)
+  case class SetRequest(id: BSONObjectID)
 
   case class SetResponse()
 
-  case class ClearRequest(id: UUID)
+  case class ClearRequest(id: BSONObjectID)
 
   case class ClearResponse()
 
   case class GetRequest()
 
-  case class GetResponse(ids: Set[UUID])
+  case class GetResponse(ids: Set[BSONObjectID])
 
   case class Snapshot()
 
 }
 
-class CharacterItems(id: UUID)(implicit config: DungeonConfig) extends PersistentActor {
+class CharacterItems(id: BSONObjectID)(implicit bindingModule: BindingModule) extends PersistentActor {
 
   import se.netcat.dungeon.CharacterItems._
 
-  case class SnapshotStateV1(items: Set[UUID])
+  case class SnapshotStateV1(items: Set[BSONObjectID])
 
   override def persistenceId = "character-items-%s".format(id)
 
-  var items: Set[UUID] = Set[UUID]()
+  var items: Set[BSONObjectID] = Set[BSONObjectID]()
 
   val receiveRecover: Receive = {
-    case message@SetRequest(_) =>
+    case message @ SetRequest(_) =>
       items += message.id
     case SnapshotOffer(_, snapshot: SnapshotStateV1) =>
       items = snapshot.items
   }
 
   val receiveCommand: Receive = {
-    case message@SetRequest(_) =>
+    case message @ SetRequest(_) =>
       persist(message) {
         message =>
           items += message.id
@@ -502,104 +508,56 @@ class CharacterItems(id: UUID)(implicit config: DungeonConfig) extends Persisten
 
 object CharacterManager {
 
-  def props(rooms: () => ActorRef, items: () => ActorRef)(implicit config: DungeonConfig) =
+  def props(rooms: () => ActorRef, items: () => ActorRef)(implicit bindingModule: BindingModule) =
     Props(new CharacterManager(rooms = rooms, items = items))
 
-  case class CreateRequest(id: UUID)
+  case class UpdateRequest(id: BSONObjectID)
 
-  case class CreateResponse(character: Option[ActorRef])
-
-  case class GetRequest(id: UUID)
-
-  case class GetResponse(character: Option[ActorRef])
-
-  case class Snapshot()
-
+  case class UpdateResponse(id: BSONObjectID, character: ActorRef)
 }
 
-class CharacterManager(rooms: () => ActorRef, items: () => ActorRef)(implicit config: DungeonConfig)
-  extends PersistentActor with ActorLogging {
+class CharacterManager(rooms: () => ActorRef, items: () => ActorRef)(implicit bindingModule: BindingModule)
+  extends Actor with ActorLogging {
 
   import se.netcat.dungeon.CharacterManager._
 
-  context.actorSelection((Module.Character, UUID.randomUUID()))
-
-  override def persistenceId = "character"
-
-  var characters = Map[UUID, ActorRef]()
-
-  val receiveRecover: Receive = LoggingReceive {
-    case CreateRequest(id) =>
-      if (!characters.contains(id)) {
-        characters += ((id, context.actorOf(Character.props(id, rooms(), items()), id)))
+  val store = new CharacterStore()
+  
+  val receive: Receive = LoggingReceive {
+    case UpdateRequest(id) =>
+      val character = context.child(id.stringify) match {
+        case Some(character) => character
+        case None => context.actorOf(Character.props(id, rooms(), items()), id.stringify)
       }
-    case SnapshotOffer(_, snapshot: Set[UUID]) =>
-      for (id <- snapshot) {
-        characters += ((id, context.actorOf(Character.props(id, rooms(), items()), id)))
-      }
-  }
-
-  val receiveCommand: Receive = LoggingReceive {
-    case message@CreateRequest(_) =>
-      persist(message) {
-        case CreateRequest(id) =>
-          if (!characters.contains(id)) {
-            characters += ((id, context.actorOf(Character.props(id, rooms(), items()), id)))
-          }
-          sender() ! CreateResponse(characters.get(id))
-      }
-
-    case GetRequest(id) => sender() ! GetResponse(characters.get(id))
-
-    case CharacterManager.Snapshot() => saveSnapshot(characters.keys.toSet)
+      sender() ! UpdateResponse(id, character)
   }
 }
 
+case class CharacterMongo(id: BSONObjectID, name: String)
 
-object CharacterResolver {
+object CharacterMongo {
+  implicit object PersonReader extends BSONDocumentReader[CharacterMongo] {
+    def read(document: BSONDocument): CharacterMongo = {
+      val id = document.getAs[BSONObjectID]("_id").get
+      val name = document.getAs[String]("name").get
 
-  def props() = Props(new CharacterResolver())
-
-  case class SetRequest(name: String, id: UUID)
-
-  case class SetResponse(success: Boolean)
-
-  case class GetRequest(name: String)
-
-  case class GetResponse(id: Option[UUID])
-
+      CharacterMongo(id, name)
+    }
+  }
 }
 
-class CharacterResolver extends PersistentActor with ActorLogging {
+class CharacterStore()(implicit val bindingModule: BindingModule) extends Injectable {
+  val collection = inject[BSONCollection](DungeonBindingKey.Mongo.Collection.Character)
 
-  override def persistenceId = "character-resolver"
-
-  import se.netcat.dungeon.CharacterResolver._
-
-  var state = Map[String, UUID]()
-
-  val receiveRecover: Receive = LoggingReceive {
-    case SetRequest(name, id) =>
-      if (!state.contains(name)) {
-        state += ((name, id))
-      }
-    case SnapshotOffer(_, snapshot: (Map[String, UUID])) =>
-      state = snapshot
+  def insert(id: BSONObjectID, name: String): Future[Unit] = {
+    collection.insert(BSONDocument("_id_" -> id, "name" -> name)).map(_ => ())
   }
 
-  val receiveCommand: Receive = LoggingReceive {
-    case message@SetRequest(_, _) =>
-      persist(message) {
-        case SetRequest(name, id) =>
-          if (!state.contains(name)) {
-            state += ((name, id))
-            sender() ! SetResponse(success = true)
-          } else {
-            sender() ! SetResponse(success = false)
-          }
-      }
-    case GetRequest(name) => sender() ! GetResponse(state.get(name))
+  def find(id: BSONObjectID): Future[Option[CharacterMongo]] = {
+    collection.find(BSONDocument("_id" -> id)).one[CharacterMongo]
+  }
 
-    case CharacterManager.Snapshot() => saveSnapshot(state)
+  def find(name: String): Future[Option[CharacterMongo]] = {
+    collection.find(BSONDocument("name" -> name)).one[CharacterMongo]
   }
 }
