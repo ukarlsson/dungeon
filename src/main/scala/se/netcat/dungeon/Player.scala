@@ -125,8 +125,10 @@ abstract class Player(connection: ActorRef, characters: ActorRef)(implicit bindi
       send("Please visit the Dungeon soon again.")
   }
 
-  when(PreStart) {
+  when(PreStart, stateTimeout = 0 second) {
     case Event(Start(), None) =>
+      goto(CharacterCheckExisting)
+    case Event(StateTimeout, None) =>
       goto(CharacterCheckExisting)
   }
 

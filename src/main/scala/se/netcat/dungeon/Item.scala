@@ -166,7 +166,7 @@ class ItemStore()(implicit val bindingModule: BindingModule) extends Injectable 
   val collection = inject[DefaultDB].collection[BSONCollection]("item")
 
   def insert(id: BSONObjectID, handles: Set[String], brief: String): Future[Unit] = {
-    collection.insert(BSONDocument("_id_" -> id, "handles" -> handles, "brief" -> brief)).map(_ => ())
+    collection.insert(BSONDocument("_id" -> id, "handles" -> handles, "brief" -> brief)).map(_ => ())
   }
 
   def find(id: BSONObjectID): Future[Option[ItemData]] = {

@@ -18,6 +18,9 @@ import reactivemongo.core.commands.LastError
 import reactivemongo.api.Collection
 import reactivemongo.api.collections.default.BSONCollection
 import reactivemongo.bson._
+import reactivemongo.api.indexes.Index
+import reactivemongo.api.indexes.IndexType
+import reactivemongo.api.indexes.IndexType
 
 object CharacterParsers extends CharacterParsers {
 
@@ -471,6 +474,8 @@ class CharacterManager(rooms: () => ActorRef, items: () => ActorRef)(implicit bi
 
 case class CharacterData(id: BSONObjectID, name: String)
 
+case class CharacterItems(items: Set[BSONObjectID])
+
 object CharacterData {
   implicit object PersonReader extends BSONDocumentReader[CharacterData] {
     def read(document: BSONDocument): CharacterData = {
@@ -486,9 +491,11 @@ class CharacterStore()(implicit val bindingModule: BindingModule) extends Inject
   import MongoBindingKey._
 
   val collection = inject[DefaultDB].collection[BSONCollection]("character")
+  
+  collection.indexesManager.ensure(Index(List("name" -> IndexType.Ascending), unique = true))
 
   def insert(id: BSONObjectID, name: String): Future[Unit] = {
-    collection.insert(BSONDocument("_id_" -> id, "name" -> name)).map(_ => ())
+    collection.insert(BSONDocument("_id" -> id, "name" -> name)).map(_ => ())
   }
 
   def find(id: BSONObjectID): Future[Option[CharacterData]] = {
