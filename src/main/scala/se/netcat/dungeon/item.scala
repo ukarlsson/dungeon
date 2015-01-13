@@ -1,4 +1,4 @@
-package se.netcat.dungeon
+package se.netcat.dungeon.item
 
 import akka.actor._
 import akka.event.LoggingReceive
@@ -12,6 +12,8 @@ import reactivemongo.api.collections.default.BSONCollection
 import reactivemongo.api.DefaultDB
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.Future
+import se.netcat.dungeon.mongo.MongoBindingKey
+import reactivemongo.bson.BSONDocumentWriter
 
 object ItemOwner {
 
@@ -134,27 +136,26 @@ class ItemManager(rooms: () => ActorRef, characters: () => ActorRef)(implicit bi
   }
 }
 
-object ItemManagerDataCollector {
-  def props(ids: Set[BSONObjectID]) = Props(new ItemManagerDataCollector(ids = ids))
-}
+case class ItemDocument(id: BSONObjectID, handles: Set[String], brief: String)
 
-class ItemManagerDataCollector(ids: Set[BSONObjectID]) extends Actor {
-  override def receive: Receive = {
-    case _ =>
+object ItemDocument {
+
+  implicit object ItemWriter extends BSONDocumentWriter[ItemDocument] {
+    def write(document: ItemDocument): BSONDocument = {
+      BSONDocument(
+        "_id" -> document.id,
+        "handles" -> document.handles,
+        "brief" -> document.brief)
+    }
   }
-}
 
-case class ItemData(id: BSONObjectID, handles: Set[String], brief: String)
-
-object ItemData {
-
-  implicit object PersonReader extends BSONDocumentReader[ItemData] {
-    def read(document: BSONDocument): ItemData = {
+  implicit object ItemReader extends BSONDocumentReader[ItemDocument] {
+    def read(document: BSONDocument): ItemDocument = {
       val id = document.getAs[BSONObjectID]("_id").get
       val handles = document.getAs[Set[String]]("handles").get
       val brief = document.getAs[String]("brief").get
 
-      ItemData(id, handles, brief)
+      ItemDocument(id, handles, brief)
     }
   }
 }
@@ -165,11 +166,11 @@ class ItemStore()(implicit val bindingModule: BindingModule) extends Injectable 
 
   val collection = inject[DefaultDB].collection[BSONCollection]("item")
 
-  def insert(id: BSONObjectID, handles: Set[String], brief: String): Future[Unit] = {
-    collection.insert(BSONDocument("_id" -> id, "handles" -> handles, "brief" -> brief)).map(_ => ())
+  def insert(document: ItemDocument): Future[Unit] = {
+    collection.insert(document).map(_ => ())
   }
 
-  def find(id: BSONObjectID): Future[Option[ItemData]] = {
-    collection.find(BSONDocument("_id" -> id)).one[ItemData]
+  def find(id: BSONObjectID): Future[Option[ItemDocument]] = {
+    collection.find(BSONDocument("_id" -> id)).one[ItemDocument]
   }
 }

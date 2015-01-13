@@ -1,10 +1,10 @@
-package se.netcat.dungeon
+package se.netcat.dungeon.character
 
 import akka.actor._
 import akka.event.LoggingReceive
 import akka.pattern._
 import akka.persistence.{ PersistentActor, SnapshotOffer }
-import se.netcat.dungeon.Implicits.{ convertPairToPath }
+import se.netcat.dungeon.common.Implicits.{ convertPairToPath }
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration._
 import scala.util.parsing.combinator.RegexParsers
@@ -21,6 +21,9 @@ import reactivemongo.bson._
 import reactivemongo.api.indexes.Index
 import reactivemongo.api.indexes.IndexType
 import reactivemongo.api.indexes.IndexType
+import se.netcat.dungeon.room._
+import se.netcat.dungeon.player._
+import se.netcat.dungeon.item._
 
 object CharacterParsers extends CharacterParsers {
 
@@ -36,7 +39,7 @@ object CharacterParsers extends CharacterParsers {
 
 trait CharacterParsers extends RegexParsers {
 
-  import se.netcat.dungeon.CharacterParsers._
+  import CharacterParsers._
 
   def direction: Parser[Direction.Value] = Direction.values.toList.map(v => v.toString ^^^ v)
     .reduceLeft(_ | _)
@@ -64,7 +67,7 @@ trait CharacterParsers extends RegexParsers {
 
   def inventory: Parser[Inventory] = "^(i|inventory)$".r ^^^ { Inventory() }
 
-  def command: Parser[Command] = look | walk | say | sleep | create
+  def command: Parser[Command] = look | walk | say | sleep | create | inventory
 }
 
 object CharacterStateData {
@@ -75,7 +78,6 @@ object CharacterStateData {
 }
 
 object CharacterMessageCategory extends Enumeration {
-
   val Say = Value("say")
   val Tell = Value("tell")
 }
@@ -93,8 +95,8 @@ object CharacterState extends Enumeration {
 
 object Character {
 
-  def props(id: BSONObjectID, rooms: ActorRef, items: ActorRef)(implicit bindingModule: BindingModule) =
-    Props(new Character(id = id, rooms = rooms, items = items))
+  def props(characterId: BSONObjectID, rooms: ActorRef, items: ActorRef)(implicit bindingModule: BindingModule) =
+    Props(new Character(characterId = characterId, rooms = rooms, items = items))
 
   case class Connect(connection: ActorRef)
   case class Disconnect(connection: ActorRef)
@@ -138,17 +140,19 @@ class CharacterLookCollector(character: ActorRef, input: Room.Description)
   }
 }
 
-class Character(id: BSONObjectID, rooms: ActorRef, items: ActorRef)(implicit bindingModule: BindingModule)
+class Character(characterId: BSONObjectID, rooms: ActorRef, items: ActorRef)(implicit bindingModule: BindingModule)
   extends LoggingFSM[CharacterState.Value, CharacterStateData.Data] with ActorLogging {
 
-  import se.netcat.dungeon.CharacterState._
-  import se.netcat.dungeon.CharacterStateData._
+  import CharacterState._
+  import CharacterStateData._
 
-  val characterItems: ActorRef = context.actorOf(CharacterItems.props(id))
+  case class InventoryResult(documents: List[CharacterItemDocument])
 
   var connections: Set[ActorRef] = Set()
 
   var location: Option[ActorRef] = None
+
+  var characterItemStore = new CharacterItemStore()
 
   startWith(RoomPending, DataNone)
 
@@ -226,11 +230,18 @@ class Character(id: BSONObjectID, rooms: ActorRef, items: ActorRef)(implicit bin
             stay()
           case CharacterParsers.Create() =>
             write("You start creating something.")
-            context.actorOf(CharacterItemCreator.props(id, items), "item-creator")
+            context.actorOf(CharacterItemCreator.props(characterId, items), "item-creator")
             goto(CreatePending)
           case CharacterParsers.Inventory() =>
             write("You start checking your inventory.")
-            context.actorOf(CharacterItemCreator.props(id, items), "item-inventory")
+            characterItemStore.find(characterId)
+              .map(documents => InventoryResult(documents))
+              .recover {
+                case e =>
+                  log.error("find failure: {}", e)
+                  InventoryResult(List())
+              }
+              .pipeTo(self)
             goto(InventoryPending)
         }
       } else {
@@ -274,11 +285,19 @@ class Character(id: BSONObjectID, rooms: ActorRef, items: ActorRef)(implicit bin
   when(CreatePending) {
     case Event(CharacterItemCreator.CreateItemResponse(result), DataNone) =>
       result match {
-        case Some(itemId) =>
-          characterItems ! CharacterItems.SetRequest(itemId)
+        case Some(document) =>
+          characterItemStore.insert(CharacterItemDocument(characterId, document.id, document.handles, document.brief))
           write("You created an item.")
         case None =>
           write("You failed to create an item.")
+      }
+      goto(Idle)
+  }
+
+  when(InventoryPending) {
+    case Event(InventoryResult(documents), DataNone) =>
+      for (document <- documents) {
+        write(document.itemId.stringify)
       }
       goto(Idle)
   }
@@ -323,14 +342,14 @@ object CharacterItemCreatorState extends Enumeration {
 
 object CharacterItemCreator {
 
-  def props(owner: BSONObjectID, items: ActorRef)(implicit bindingModule: BindingModule) =
-    Props(new CharacterItemCreator(owner = owner, items = items))
+  def props(characterId: BSONObjectID, items: ActorRef)(implicit bindingModule: BindingModule) =
+    Props(new CharacterItemCreator(characterId = characterId, items = items))
 
-  case class CreateItemResponse(id: Option[BSONObjectID])
+  case class CreateItemResponse(document: Option[ItemDocument])
 }
 
-class CharacterItemCreator(owner: BSONObjectID, items: ActorRef)(implicit bindingModule: BindingModule)
-  extends LoggingFSM[CharacterItemCreatorState.Value, Option[ActorRef]] {
+class CharacterItemCreator(characterId: BSONObjectID, items: ActorRef)(implicit bindingModule: BindingModule)
+  extends LoggingFSM[CharacterItemCreatorState.Value, Option[ActorRef]] with ActorLogging {
 
   import CharacterItemCreator._
   import CharacterItemCreatorState._
@@ -338,50 +357,52 @@ class CharacterItemCreator(owner: BSONObjectID, items: ActorRef)(implicit bindin
   case class Start()
 
   case class ItemInsertResult(result: Boolean)
-  
+
   val store = new ItemStore()
 
-  val id = BSONObjectID.generate
-  
+  val document = ItemDocument(id = BSONObjectID.generate, handles = Set("basic"), brief = "a basic item")
+
   startWith(PreStart, None)
 
   self ! Start()
-  
+
   def success() = {
-    context.parent ! CreateItemResponse(Some(id))
+    context.parent ! CreateItemResponse(Some(document))
     stop()
   }
-      
+
   def failure() = {
     context.parent ! CreateItemResponse(None)
     stop()
   }
-  
+
   override def receive: Receive = LoggingReceive {
     case message => super.receive(message)
   }
-  
+
   onTransition {
     case _ -> StateInsert =>
-      store.insert(id, Set("basic"), "a basic item").andThen {
-        case Success(()) => self ! ItemInsertResult(true)
-        case Failure(_) => self ! ItemInsertResult(false)
+      store.insert(document).andThen {
+        case Success(()) =>
+          self ! ItemInsertResult(true)
+        case Failure(e) =>
+          log.error("insert failure: {}", e)
+          self ! ItemInsertResult(false)
       }
     case _ -> StateUpdate =>
-      items ! ItemManager.UpdateRequest(id, ItemClass.Basic)
+      items ! ItemManager.UpdateRequest(document.id, ItemClass.Basic)
     case _ -> StateOwner =>
       nextStateData match {
         case Some(item) =>
-         item ! Item.SetOwnerRequest(0, Some(owner))
+          item ! Item.SetOwnerRequest(0, Some(characterId))
       }
   }
 
   when(PreStart) {
     case Event(Start(), None) =>
-      store.insert(id, Set("basic"), "a basic item")
       goto(StateInsert)
   }
-  
+
   when(StateInsert) {
     case Event(ItemInsertResult(result), None) =>
       result match {
@@ -404,48 +425,6 @@ class CharacterItemCreator(owner: BSONObjectID, items: ActorRef)(implicit bindin
   }
 }
 
-object CharacterItems {
-
-  def props(id: BSONObjectID)(implicit bindingModule: BindingModule) = Props(new CharacterItems(id = id))
-
-  case class SetRequest(id: BSONObjectID)
-  case class SetResponse()
-  case class ClearRequest(id: BSONObjectID)
-  case class ClearResponse()
-  case class GetRequest()
-  case class GetResponse(ids: Set[BSONObjectID])
-  case class Snapshot()
-}
-
-class CharacterItems(id: BSONObjectID)(implicit bindingModule: BindingModule) extends PersistentActor {
-
-  import se.netcat.dungeon.CharacterItems._
-
-  case class SnapshotStateV1(items: Set[BSONObjectID])
-
-  override def persistenceId = "character-items-%s".format(id)
-
-  var items: Set[BSONObjectID] = Set[BSONObjectID]()
-
-  val receiveRecover: Receive = {
-    case message @ SetRequest(_) =>
-      items += message.id
-    case SnapshotOffer(_, snapshot: SnapshotStateV1) =>
-      items = snapshot.items
-  }
-
-  val receiveCommand: Receive = {
-    case message @ SetRequest(_) =>
-      persist(message) {
-        message =>
-          items += message.id
-          sender() ! SetResponse()
-      }
-    case GetRequest() => sender() ! GetResponse(items)
-    case Snapshot() => saveSnapshot(SnapshotStateV1(items))
-  }
-}
-
 object CharacterManager {
 
   def props(rooms: () => ActorRef, items: () => ActorRef)(implicit bindingModule: BindingModule) =
@@ -461,7 +440,7 @@ class CharacterManager(rooms: () => ActorRef, items: () => ActorRef)(implicit bi
   import CharacterManager._
 
   val store = new CharacterStore()
-  
+
   val receive: Receive = LoggingReceive {
     case UpdateRequest(id) =>
       val character = context.child(id.stringify) match {
@@ -472,37 +451,77 @@ class CharacterManager(rooms: () => ActorRef, items: () => ActorRef)(implicit bi
   }
 }
 
-case class CharacterData(id: BSONObjectID, name: String)
+case class CharacterItemDocument(characterId: BSONObjectID, itemId: BSONObjectID, handles: Set[String], brief: String)
 
-case class CharacterItems(items: Set[BSONObjectID])
+object CharacterItemDocument {
 
-object CharacterData {
-  implicit object PersonReader extends BSONDocumentReader[CharacterData] {
-    def read(document: BSONDocument): CharacterData = {
+  implicit object CharacterItemWriter extends BSONDocumentWriter[CharacterItemDocument] {
+    def write(document: CharacterItemDocument): BSONDocument = {
+      BSONDocument(
+        "characterId" -> document.characterId,
+        "itemId" -> document.itemId,
+        "handles" -> document.handles,
+        "brief" -> document.brief)
+    }
+  }
+
+  implicit object CharacterItemReader extends BSONDocumentReader[CharacterItemDocument] {
+    def read(document: BSONDocument): CharacterItemDocument = {
+      val characterId = document.getAs[BSONObjectID]("characterId").get
+      val itemId = document.getAs[BSONObjectID]("itemId").get
+      val handles = document.getAs[Set[String]]("handles").get
+      val brief = document.getAs[String]("brief").get
+
+      CharacterItemDocument(characterId, itemId, handles, brief)
+    }
+  }
+}
+
+class CharacterItemStore()(implicit val bindingModule: BindingModule) extends Injectable {
+  val collection = inject[DefaultDB].collection[BSONCollection]("character.item")
+
+  collection.indexesManager.ensure(Index(List("characterId" -> IndexType.Ascending, "itemId" -> IndexType.Ascending), unique = true))
+
+  def insert(document: CharacterItemDocument): Future[Unit] = {
+    collection.insert(document).map(_ => ())
+  }
+
+  def remove(characterId: BSONObjectID, itemId: BSONObjectID): Future[Unit] = {
+    collection.remove(BSONDocument("characterId" -> characterId, "itemId" -> itemId)).map(_ => ())
+  }
+
+  def find(characterId: BSONObjectID): Future[List[CharacterItemDocument]] = {
+    collection.find(BSONDocument("characterId" -> characterId)).cursor[CharacterItemDocument].collect[List]()
+  }
+}
+
+case class CharacterDocument(id: BSONObjectID, name: String)
+
+object CharacterDocument {
+  implicit object PersonReader extends BSONDocumentReader[CharacterDocument] {
+    def read(document: BSONDocument): CharacterDocument = {
       val id = document.getAs[BSONObjectID]("_id").get
       val name = document.getAs[String]("name").get
 
-      CharacterData(id, name)
+      CharacterDocument(id, name)
     }
   }
 }
 
 class CharacterStore()(implicit val bindingModule: BindingModule) extends Injectable {
-  import MongoBindingKey._
-
   val collection = inject[DefaultDB].collection[BSONCollection]("character")
-  
+
   collection.indexesManager.ensure(Index(List("name" -> IndexType.Ascending), unique = true))
 
   def insert(id: BSONObjectID, name: String): Future[Unit] = {
     collection.insert(BSONDocument("_id" -> id, "name" -> name)).map(_ => ())
   }
 
-  def find(id: BSONObjectID): Future[Option[CharacterData]] = {
-    collection.find(BSONDocument("_id" -> id)).one[CharacterData]
+  def find(id: BSONObjectID): Future[Option[CharacterDocument]] = {
+    collection.find(BSONDocument("_id" -> id)).one[CharacterDocument]
   }
 
-  def find(name: String): Future[Option[CharacterData]] = {
-    collection.find(BSONDocument("name" -> name)).one[CharacterData]
+  def find(name: String): Future[Option[CharacterDocument]] = {
+    collection.find(BSONDocument("name" -> name)).one[CharacterDocument]
   }
 }

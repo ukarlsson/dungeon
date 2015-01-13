@@ -1,4 +1,4 @@
-package se.netcat.dungeon
+package se.netcat.dungeon.common
 
 import java.util.UUID
 import akka.actor.{ActorPath, ActorSystem}
@@ -16,9 +16,8 @@ object Implicits {
   }
 }
 
-class DungeonConfig(val system: ActorSystem, val modules: Map[Manager.Value, String] )
-
-object DungeonConfig {
-  def apply(system: ActorSystem, modules: Map[Manager.Value, String] ) =
-    new DungeonConfig(system, modules)
+object Manager extends Enumeration {
+  var Character = Value
+  var Item = Value
+  var Room = Value
 }

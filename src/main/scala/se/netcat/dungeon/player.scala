@@ -1,4 +1,4 @@
-package se.netcat.dungeon
+package se.netcat.dungeon.player
 
 import java.util.UUID
 import akka.actor._
@@ -12,51 +12,40 @@ import scala.util.Success
 import scala.util.Failure
 import scala.concurrent.ExecutionContext.Implicits.global
 import com.escalatesoft.subcut.inject.Injectable
-import Implicits.convertPairToPath
+import se.netcat.dungeon.common.Implicits.convertPairToPath
+
+import se.netcat.dungeon.character._
+import se.netcat.dungeon.common._
+
+object PlayerParsers extends PlayerParsers {
+  sealed trait Command
+
+  case class Use(name: String) extends Command
+  case class Create(name: String) extends Command
+  case class Exit() extends Command
+}
 
 trait PlayerParsers extends RegexParsers {
-
-  import se.netcat.dungeon.PlayerParsers._
+  import PlayerParsers._
 
   def name: Parser[String] = "^[a-zA-Z]+$".r ^^ {
     _.toLowerCase
   }
 
   def yes: Parser[Boolean] = "^yes$".r ^^^ true
-
   def no: Parser[Boolean] = "^no$".r ^^^ false
-
   def exit: Parser[Exit] = "^exit$".r ^^^ Exit()
-
   def boolean: Parser[Boolean] = yes | no
-
   def command: Parser[Command] = exit
 }
 
-object PlayerParsers extends PlayerParsers {
-
-  sealed trait Command
-
-  case class Use(name: String) extends Command
-
-  case class Create(name: String) extends Command
-
-  case class Exit() extends Command
-
-}
-
 object Player {
-
   case class IncomingMessage(data: String)
-
   case class OutgoingMessage(data: String)
-
   case class Terminate()
-
 }
 
 object PlayerState extends Enumeration {
-
   type PlayerConnectionState = Value
 
   val PreStart = Value
@@ -68,7 +57,6 @@ object PlayerState extends Enumeration {
 }
 
 object PlayerData {
-
   sealed trait Data
 
   final case class DataCharacterInfo(id: BSONObjectID, name: String) extends Data
@@ -86,7 +74,7 @@ abstract class Player(connection: ActorRef, characters: ActorRef)(implicit bindi
   case class Start()
 
   case class CharacterInsertResult(result: Boolean)
-  case class CharacterFindResult(result: Option[CharacterData])
+  case class CharacterFindResult(result: Option[CharacterDocument])
 
   implicit val managers = inject[Map[Manager.Value, String]]
 
@@ -161,7 +149,7 @@ abstract class Player(connection: ActorRef, characters: ActorRef)(implicit bindi
 
     case Event(CharacterFindResult(result), None) =>
       result match {
-        case Some(CharacterData(id, name)) =>
+        case Some(CharacterDocument(id, name)) =>
           goto(CharacterUpdate).using(Some(DataCharacterInfo(id, name)))
         case None =>
           send("Unable lo locate character.")

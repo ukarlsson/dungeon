@@ -1,13 +1,13 @@
-package se.netcat.dungeon
+package se.netcat.dungeon.room
 
 import akka.actor._
 import akka.event.LoggingReceive
 
 import scala.collection.mutable
 
-object Direction extends Enumeration {
+import se.netcat.dungeon.character._
 
-  type Direction = Value
+object Direction extends Enumeration {
 
   val North = Value("north")
   val South = Value("south")
@@ -15,8 +15,12 @@ object Direction extends Enumeration {
   val West = Value("west")
 }
 
-object Room {
+object SpecialRoom extends Enumeration {
+  val Start = Value
+}
 
+
+object Room {
   def props(brief: String, exits: () => Map[Direction.Value, ActorRef]) = Props(
     new Room(brief = brief, exits = exits))
 
@@ -30,12 +34,10 @@ object Room {
 
   case class Description(brief: String, complete: String, characters: Set[ActorRef],
     exits: Map[Direction.Value, ActorRef])
-
 }
 
 class Room(brief: String, exits: () => Map[Direction.Value, ActorRef]) extends Actor with ActorLogging {
-
-  import se.netcat.dungeon.Room._
+  import Room._
 
   val characters = mutable.Set[ActorRef]()
 

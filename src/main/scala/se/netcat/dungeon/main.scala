@@ -1,11 +1,10 @@
-package se.netcat.dungeon
+package se.netcat.dungeon.main
 
 import java.net.InetSocketAddress
 import java.util.UUID
 import akka.actor._
 import akka.io.{ IO, Tcp }
 import scala.concurrent.ExecutionContext.Implicits.global
-import se.netcat.dungeon.Implicits.convertPairToPath
 import reactivemongo.api.MongoDriver
 import reactivemongo.api.DefaultDB
 import com.escalatesoft.subcut.inject.NewBindingModule
@@ -15,15 +14,13 @@ import com.escalatesoft.subcut.inject.BindingModule
 import reactivemongo.core.nodeset.Connection
 import reactivemongo.api.collections.default.BSONCollection
 
-object SpecialRoom extends Enumeration {
-  val Start = Value
-}
-
-object Manager extends Enumeration {
-  var Character = Value
-  var Item = Value
-  var Room = Value
-}
+import se.netcat.dungeon.common.Implicits.convertPairToPath
+import se.netcat.dungeon.mongo._
+import se.netcat.dungeon.common._
+import se.netcat.dungeon.character.CharacterManager
+import se.netcat.dungeon.item.ItemManager
+import se.netcat.dungeon.room.RoomManager
+import se.netcat.dungeon.player.TcpPlayer
 
 object MongoBindingKey {
   object NodeList extends BindingId
@@ -75,7 +72,6 @@ object MongoModule extends NewBindingModule(module => {
 })
 
 object Main extends App {
-  
   implicit val bindingModule = MongoModule
   
   val system = bindingModule.inject[ActorSystem](None)
@@ -102,7 +98,8 @@ class Server(characters: () => ActorRef)(implicit bindingModule: BindingModule) 
 
   implicit val system = context.system
   
-  IO(Tcp) ! Bind(self, new InetSocketAddress("localhost", 30000))
+  // IO(Tcp) ! Bind(self, new InetSocketAddress("localhost", 30000))
+  IO(Tcp) ! Bind(self, new InetSocketAddress("10.48.32.117", 30000))
 
   override def receive: Receive = {
     case bound @ Bound(localAddress) =>
@@ -118,4 +115,3 @@ class Server(characters: () => ActorRef)(implicit bindingModule: BindingModule) 
       connection ! Register(player)
   }
 }
-
